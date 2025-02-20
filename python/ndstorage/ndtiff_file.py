@@ -1,6 +1,6 @@
 import numpy as np
 import sys
-import json
+# import json # replaced with orjson
 import os
 import time
 import struct
@@ -12,6 +12,11 @@ from .ndtiff_index import NDTiffIndexEntry
 
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+
+import orjson # faster than json
+import threading # used to run async loop in a seperated thread
+import asyncio # needed for async file writing
+import aiofile # fast async file writing
 
 MAJOR_VERSION = 3
 MINOR_VERSION = 3
@@ -63,13 +68,15 @@ class SingleNDTiffWriter:
 
         os.makedirs(directory, exist_ok=True)
         # pre-allocate the file
+        # pre-allocation should not be necessary
         file_path = os.path.join(directory, filename)
-        with open(file_path, 'wb') as f:
-            f.seek(MAX_FILE_SIZE - 1)
-            f.write(b'\0')
-            f.flush()
+        #with open(file_path, 'wb') as f:
+        #    f.seek(MAX_FILE_SIZE - 1)
+        #    f.write(b'\0')
+        #    f.flush()
 
         # reopen the file in binary mode
+        # open the file in read/write in aio mode
         self.file = open(file_path, 'rb+')
         # reset position to 0
         self.file.seek(0)
@@ -91,7 +98,8 @@ class SingleNDTiffWriter:
         return True
 
     def _write_mm_header_and_summary_md(self, summary_md):
-        summary_md_bytes = self._get_bytes_from_string(json.dumps(summary_md))
+        #summary_md_bytes = self._get_bytes_from_string(json.dumps(summary_md))
+        summary_md_bytes = orjson.dumps(summary_md) # orjson returns bytes
         md_length = len(summary_md_bytes)
         header_buffer = bytearray(28)
 
@@ -115,8 +123,9 @@ class SingleNDTiffWriter:
         for buffer in [header_buffer, summary_md_bytes]:
             self.file.write(buffer)
 
-    def _get_bytes_from_string(self, s):
-        return s.encode('utf-8')
+    # orjson encodes already to bytes
+    #def _get_bytes_from_string(self, s):
+    #    return s.encode('utf-8')
 
     def finished_writing(self):
         self._write_null_offset_after_last_image()
@@ -158,7 +167,8 @@ class SingleNDTiffWriter:
             bit_depth = 8 if pixels.dtype == np.uint8 else 16
         # if metadata is a dict, serialize it to a json string and make it a utf8 byte buffer
         if isinstance(metadata, dict):
-            metadata = self._get_bytes_from_string(json.dumps(metadata))
+            # metadata = self._get_bytes_from_string(json.dumps(metadata))
+            metadata = orjson.dumps(metadata) # orjson returns bytes
         ied = self._write_ifd(index_key, pixels, metadata, rgb, image_height, image_width, bit_depth)
         while self.buffers:
             self.file.write(self.buffers.popleft())
@@ -368,7 +378,7 @@ class SingleNDTiffReader:
         return self.file.read(end - start)
 
     def read_metadata(self, index):
-        return json.loads(
+        return orjson.loads(
             self._read(
                 index["metadata_offset"], index["metadata_offset"] + index["metadata_length"]
             )
