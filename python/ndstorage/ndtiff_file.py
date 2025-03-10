@@ -67,7 +67,8 @@ class SingleNDTiffWriter:
         with open(file_path, 'wb') as f:
             f.seek(MAX_FILE_SIZE - 1)
             f.write(b'\0')
-            f.flush()
+            # f.flush() # does write the full file size with b'\0' to disc. This takes time.
+            # without flush the file is generated with the correct size but the file is not filled with b'\0'
 
         # reopen the file in binary mode
         self.file = open(file_path, 'rb+')
