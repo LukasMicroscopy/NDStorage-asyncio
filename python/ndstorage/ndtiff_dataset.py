@@ -44,6 +44,7 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
 
         self.file_io = file_io
         self._lock = threading.RLock()
+        self._new_file_lock = threading.Lock() # Lock for creating new file when current one is full
         if writable:
             self.major_version = MAJOR_VERSION
             self.minor_version = MINOR_VERSION
@@ -180,6 +181,8 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
         self._new_image_event.set()
 
         # Create a new file if needed
+        self._new_file_lock.acquire() # acquire lock to prevent multiple threads from creating new files
+        # the lock has to be acquired before checking if a new file is needed
         if self.current_writer is None:
             filename = 'NDTiffStack.tif'
             if self.name is not None:
@@ -188,13 +191,21 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
             self.file_index += 1
             # create the index file
             self._index_file = open(os.path.join(self.path, "NDTiff.index"), "wb")
+            self._new_file_lock.release()
         elif not self.current_writer.has_space_to_write(image, metadata):
-            self.current_writer.finished_writing()
+            last_writer = self.current_writer # save the current writer to finish after new one is created
+            
             filename = 'NDTiffStack_{}.tif'.format(self.file_index)
             if self.name is not None:
                 filename = self.name + '_' + filename
             self.current_writer = SingleNDTiffWriter(self.path, filename, self._summary_metadata)
             self.file_index += 1
+            self._new_file_lock.release()
+
+            last_writer.finished_writing() # finish writing to the last file
+        # release lock if no new file was created
+        if self._new_file_lock.locked():
+            self._new_file_lock.release() 
 
         index_data_entry = self.current_writer.write_image(frozenset(coordinates.items()), image, metadata)
         # create readers and update axes
@@ -370,7 +381,7 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
 
 
 
-def _create_unique_acq_dir(root, prefix):
+def _create_unique_acq_dir(root, prefix):#
     if not os.path.exists(root):
         os.makedirs(root)
 
