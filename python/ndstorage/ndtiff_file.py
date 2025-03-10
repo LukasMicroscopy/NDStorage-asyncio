@@ -4,6 +4,7 @@ import json
 import os
 import time
 import struct
+import zlib
 import warnings
 from collections import OrderedDict
 from io import BytesIO
@@ -49,7 +50,7 @@ _CHANNEL_AXIS = "channel"
 
 class SingleNDTiffWriter:
 
-    def __init__(self, directory, filename, summary_md):
+    def __init__(self, directory, filename, summary_md, compression_scheme = 1):
         self.filename = os.path.join(directory, filename)
         self.index_map = {}
         self.next_ifd_offset_location = -1
@@ -58,6 +59,10 @@ class SingleNDTiffWriter:
         self.z_step_um = 1
         self.buffers = deque()
         self.first_ifd = True
+        if compression_scheme == 1 or compression_scheme == 8:
+            self.compression_scheme = compression_scheme
+        else:
+            raise ValueError("Invalid compression scheme, only 1 (no compression) and 8 (LZW) are supported")
 
         self.start_time = None
 
@@ -133,7 +138,7 @@ class SingleNDTiffWriter:
         self.file.write(buffer)
         self.file.seek(current_pos)
 
-    def write_image(self, index_key, pixels, metadata, bit_depth='auto'):
+    def write_image(self, index_key, pixels, metadata, bit_depth='auto', compression_scheme=0):
         """
         Write an image to the file
 
@@ -153,14 +158,24 @@ class SingleNDTiffWriter:
         NDTiffIndexEntry
             The index entry for the image
         """
+        if compression_scheme == 0:
+            compression_scheme = self.compression_scheme
+
         image_height, image_width = pixels.shape
         rgb = pixels.ndim == 3 and pixels.shape[2] == 3
+        if rgb:
+            warnings.warn("Compression scheme is not supported for RGB images. Using no compression.")
+            compression_scheme = 1
+        if compression_scheme != 1 or compression_scheme != 8:
+            warnings.warn("Invalid compression scheme, only 1 (no compression) and 8 (LZW) are supported. Using 1 (no compression).")
+            compression_scheme = 1
+                
         if bit_depth == 'auto':
             bit_depth = 8 if pixels.dtype == np.uint8 else 16
         # if metadata is a dict, serialize it to a json string and make it a utf8 byte buffer
         if isinstance(metadata, dict):
             metadata = self._get_bytes_from_string(json.dumps(metadata))
-        ied = self._write_ifd(index_key, pixels, metadata, rgb, image_height, image_width, bit_depth)
+        ied = self._write_ifd(index_key, pixels, metadata, rgb, image_height, image_width, bit_depth, compression_scheme)
         while self.buffers:
             self.file.write(self.buffers.popleft())
         # make sure the file is flushed to disk
@@ -169,13 +184,17 @@ class SingleNDTiffWriter:
         return ied
 
 
-    def _write_ifd(self, index_key, pixels, metadata, rgb, image_height, image_width, bit_depth):
+    def _write_ifd(self, index_key, pixels, metadata, rgb, image_height, image_width, bit_depth, compression_scheme):
         if self.file.tell() % 2 == 1:
             #self.file.seek(self.file.tell() + 1)  # Make IFD start on word
             self.file.write(b'\0') # Make IFD start on word, by writing a null byte (equal to +1) to the file, since the file is not initialized with null bytes
 
         byte_depth = 1 if isinstance(pixels, bytearray) else 2
-        bytes_per_image_pixels = self._bytes_per_image_pixels(pixels, rgb)
+        if compression_scheme == 8:
+            compressed_pixels = zlib.compress(pixels)
+            bytes_per_image_pixels = len(compressed_pixels)
+        else:
+            bytes_per_image_pixels = self._bytes_per_image_pixels(pixels, rgb)
         num_entries = 13
 
         # 2 bytes for number of directory entries, 12 bytes per directory entry, 4 byte offset of next IFD
@@ -204,7 +223,7 @@ class SingleNDTiffWriter:
         buffer_position += self._write_ifd_entry(ifd_and_small_vals_buffer, HEIGHT, 4, 1, image_height, buffer_position)
         buffer_position += self._write_ifd_entry(ifd_and_small_vals_buffer, BITS_PER_SAMPLE, 3, 3 if rgb else 1,
                                                  bits_per_sample_offset if rgb else byte_depth * 8, buffer_position)
-        buffer_position += self._write_ifd_entry(ifd_and_small_vals_buffer, COMPRESSION, 3, 1, 1, buffer_position)
+        buffer_position += self._write_ifd_entry(ifd_and_small_vals_buffer, COMPRESSION, 3, 1, compression_scheme, buffer_position)
         buffer_position += self._write_ifd_entry(ifd_and_small_vals_buffer, PHOTOMETRIC_INTERPRETATION, 3, 1,
                                                  2 if rgb else 1, buffer_position)
         buffer_position += self._write_ifd_entry(ifd_and_small_vals_buffer, STRIP_OFFSETS, 4, 1, pixel_data_offset,
@@ -237,7 +256,10 @@ class SingleNDTiffWriter:
         buffer_position += 8
 
         self.buffers.append(ifd_and_small_vals_buffer)
-        self.buffers.append(self._get_pixel_buffer(pixels, rgb))
+        if compression_scheme == 8:
+            self.buffers.append(compressed_pixels)
+        else:
+            self.buffers.append(self._get_pixel_buffer(pixels, rgb))
         self.buffers.append(metadata)
 
         self.first_ifd = False
