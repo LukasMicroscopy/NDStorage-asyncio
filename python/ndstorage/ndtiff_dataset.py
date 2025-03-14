@@ -199,9 +199,9 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
                 filename = self.name + '_' + filename
             self.current_writer = SingleNDTiffWriter(self.path, filename, self._summary_metadata, compression_scheme = self._compression_scheme)
             self.file_index += 1
+            #self._new_file_lock.release() # release lock after creating new file
             # create the index file
             self._index_file = open(os.path.join(self.path, "NDTiff.index"), "wb")
-            self._new_file_lock.release()
         elif not self.current_writer.has_space_to_write(image, metadata):
             last_writer = self.current_writer # save the current writer to finish after new one is created
             
@@ -210,14 +210,12 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
                 filename = self.name + '_' + filename
             self.current_writer = SingleNDTiffWriter(self.path, filename, self._summary_metadata, compression_scheme = self._compression_scheme)
             self.file_index += 1
-            self._new_file_lock.release()
-
+            #self._new_file_lock.release() # release lock after creating new file
             last_writer.finished_writing() # finish writing to the last file
-        # release lock if no new file was created
-        if self._new_file_lock.locked():
-            self._new_file_lock.release() 
-
+        #if not self._new_file_lock.locked():
+        #    self._new_file_lock.acquire() # acquire lock to prevent multiple threads from writing to the same file
         index_data_entry = self.current_writer.write_image(frozenset(coordinates.items()), image, metadata, compression_scheme=compression_scheme)
+        self._new_file_lock.release() # release lock after writing to file
         # create readers and update axes
         self.add_index_entry(index_data_entry, new_image_updates=False)
         # write the index to disk
@@ -279,7 +277,10 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
                 self.index[frozenset(image_coordinates.items())] = index_entry
 
             if index_entry.filename not in self._readers_by_filename:
-                new_reader = SingleNDTiffReader(os.path.join(self.path, index_entry.filename), file_io=self.file_io)
+                if index_entry.filename == self.current_writer.filename.split(os.sep)[-1]:
+                    new_reader = self.current_writer.reader
+                else:
+                    new_reader = SingleNDTiffReader(os.path.join(self.path, index_entry.filename), file_io=self.file_io)
                 self._readers_by_filename[index_entry.filename] = new_reader
                 # Should be the same on every file so resetting them is fine
                 self.major_version, self.minor_version = new_reader.major_version, new_reader.minor_version
