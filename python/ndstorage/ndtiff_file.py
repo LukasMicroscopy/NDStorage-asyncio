@@ -138,7 +138,7 @@ class SingleNDTiffWriter:
         self.file.write(buffer)
         self.file.seek(current_pos)
 
-    def write_image(self, index_key, pixels, metadata, bit_depth='auto', compression_scheme=0):
+    def write_image(self, index_key, pixels, metadata, bit_depth='auto', compression_scheme = 0):
         """
         Write an image to the file
 
@@ -164,10 +164,10 @@ class SingleNDTiffWriter:
         image_height, image_width = pixels.shape
         rgb = pixels.ndim == 3 and pixels.shape[2] == 3
         if rgb:
-            warnings.warn("Compression scheme is not supported for RGB images. Using no compression.")
+            warnings.warn(f"Compression scheme {compression_scheme} is not supported for RGB images. Using no compression.")
             compression_scheme = 1
-        if compression_scheme != 1 or compression_scheme != 8:
-            warnings.warn("Invalid compression scheme, only 1 (no compression) and 8 (LZW) are supported. Using 1 (no compression).")
+        if compression_scheme != 1 and compression_scheme != 8:
+            warnings.warn(f"Invalid compression scheme {compression_scheme}, only 1 (no compression) and 8 (LZW) are supported. Using 1 (no compression).")
             compression_scheme = 1
                 
         if bit_depth == 'auto':
@@ -190,6 +190,8 @@ class SingleNDTiffWriter:
             self.file.write(b'\0') # Make IFD start on word, by writing a null byte (equal to +1) to the file, since the file is not initialized with null bytes
 
         byte_depth = 1 if isinstance(pixels, bytearray) else 2
+        if bit_depth == 8:
+            byte_depth = 1
         if compression_scheme == 8:
             compressed_pixels = zlib.compress(pixels)
             bytes_per_image_pixels = len(compressed_pixels)
@@ -275,7 +277,7 @@ class SingleNDTiffWriter:
         }.get(bit_depth, NDTiffIndexEntry.EIGHT_BIT_RGB if rgb else None)
 
         return NDTiffIndexEntry(index_key, pixel_type, pixel_data_offset, image_width, image_height, metadata_offset,
-                                len(metadata), self.filename.split(os.sep)[-1])
+                                len(metadata), self.filename.split(os.sep)[-1], pixel_compression=compression_scheme)
 
     def _write_ifd_entry(self, buffer, tag, dtype, count, value, buffer_position):
         struct.pack_into('<HHII', buffer, buffer_position, tag, dtype, count, value)
@@ -323,7 +325,9 @@ class SingleNDTiffReader:
     TWELVE_BIT_MONOCHROME = 4
     FOURTEEN_BIT_MONOCHROME = 5
     ELEVEN_BIT_MONOCHROME = 6
-
+ 
+    LZW_COMPRESSED = 8
+    NO_COMPRESSION = 1
     UNCOMPRESSED = 0
 
     def __init__(self, tiff_path, file_io: NDTiffFileIO = BUILTIN_FILE_IO, summary_md=None):
@@ -417,6 +421,8 @@ class SingleNDTiffReader:
         width = index_entry.image_width
         height = index_entry.image_height
         data = self._read(index_entry.pix_offset, index_entry.pix_offset + width * height * bytes_per_pixel)
+        if index_entry.pixel_compression == self.LZW_COMPRESSED:
+            data = zlib.decompress(data)
         pixels = np.frombuffer(data, dtype=dtype)
         image = pixels.reshape([height, width, 3] if bytes_per_pixel == 3 else [height, width])
         return image

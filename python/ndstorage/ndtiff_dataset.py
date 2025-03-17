@@ -61,7 +61,7 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
                 if compression_scheme == 1 or compression_scheme == 8:
                     self._compression_scheme = compression_scheme
                 else:
-                    raise ValueError("Compression scheme must be 1 or 8")
+                    raise ValueError("Compression scheme must be 1 (NO) or 8 (LZW) compression!")
             self.current_writer = None
             self.file_index = 0
             self.name = name

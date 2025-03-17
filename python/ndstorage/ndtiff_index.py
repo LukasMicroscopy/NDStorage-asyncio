@@ -31,7 +31,7 @@ class NDTiffIndexEntry:
 
     UNCOMPRESSED = 0
 
-    def __init__(self, axes_key, pixel_type, pix_offset, image_width, image_height, md_offset, md_length, filename):
+    def __init__(self, axes_key, pixel_type, pix_offset, image_width, image_height, md_offset, md_length, filename, pixel_compression):
         self.axes_key = axes_key
         self.pix_offset = pix_offset
         self.image_width = image_width
@@ -39,7 +39,7 @@ class NDTiffIndexEntry:
         self.metadata_length = md_length
         self.metadata_offset = md_offset
         self.pixel_type = pixel_type
-        self.pixel_compression = self.UNCOMPRESSED
+        self.pixel_compression = pixel_compression
         self.metadata_compression = self.UNCOMPRESSED
         self.filename = filename
         self.data_set_finished_entry = axes_key is None
@@ -110,7 +110,7 @@ class NDTiffIndexEntry:
             metadata_offset, metadata_length, metadata_compression = \
             struct.unpack("IIIIIIII", data[position: position + 32])
         index_entry = NDTiffIndexEntry(axes.items, pixel_type, pixel_offset, image_width, image_height,
-                                        metadata_offset, metadata_length, filename)
+                                        metadata_offset, metadata_length, filename, pixel_compression)
         position += 32
         return position, axes, index_entry
 

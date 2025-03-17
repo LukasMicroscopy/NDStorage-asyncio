@@ -5,9 +5,9 @@ import threading
 import time
 import sys
 from collections import deque
-from ..ndtiff_file import SingleNDTiffWriter, SingleNDTiffReader
+#from ..ndtiff_file import SingleNDTiffWriter, SingleNDTiffReader
 from ..ndtiff_dataset import NDTiffDataset
-from ..ndram_dataset import NDRAMDataset
+#from ..ndram_dataset import NDRAMDataset
 import pytest
 
 @pytest.fixture(scope="function")
@@ -20,14 +20,14 @@ def test_data_path(tmp_path_factory):
 
 # loop for threaded writing
 def image_write_loop(my_deque: deque, dataset: NDTiffDataset, run_event: threading.Event):
-    while run_event and len(my_deque) == 0:
+    while run_event.is_set() or len(my_deque) != 0:
         try:
             if my_deque:
                 current_time, pixels = my_deque.popleft()
                 axes = {'time': current_time}
                 dataset.put_image(axes, pixels, {'time_metadata': current_time})
             else:
-                time.sleep(0.001)
+                time.sleep(0.01)
         except IndexError:
             break
 
@@ -39,9 +39,11 @@ def test_write_full_dataset_multithreaded(test_data_path):
     assert sys.version_info[1] >= 13, "For test_write_full_dataset_multithreaded Python >= 3.13 is recommended"
 
     full_path = os.path.join(test_data_path, 'test_write_full_dataset')
-    dataset = NDTiffDataset(full_path, summary_metadata={}, writable=True)
+    dataset = NDTiffDataset(full_path, summary_metadata={}, writable=True, compression_scheme=8)
     image_deque = deque()
     run_event = threading.Event()
+
+    run_event.set()
 
     image_height = 256
     image_width = 256
@@ -68,10 +70,11 @@ def test_write_full_dataset_multithreaded(test_data_path):
 
     # read the file back in
     dataset = NDTiffDataset(full_path)
-    for time in range(time_limit):
-        pixels = np.ones(image_height * image_width, dtype=np.uint16).reshape((image_height, image_width)) * time
-        axes = {'time': time}
+    for time_index in range(time_limit):
+        pixels = np.ones(image_height * image_width, dtype=np.uint16).reshape((image_height, image_width)) * time_index
+        axes = {'time': time_index}
         read_image = dataset.read_image(**axes)
         assert np.all(read_image == pixels)
-        assert dataset.read_metadata(**axes) == {'time_metadata': time}
+        assert dataset.read_metadata(**axes) == {'time_metadata': time_index}
+
 
