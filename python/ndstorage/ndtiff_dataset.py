@@ -7,13 +7,22 @@ import warnings
 import re
 
 from .file_io import NDTiffFileIO, BUILTIN_FILE_IO
+import mmap
 from .ndtiff_file import SingleNDTiffReader
 from .ndtiff_file import _CHANNEL_AXIS
 from .ndtiff_index import NDTiffIndexEntry, read_ndtiff_index
 
 from .ndtiff_file import SingleNDTiffWriter, MAJOR_VERSION, MINOR_VERSION
+from .ndtiff_aiofile import SingleNDTiffAsyncWriter
 
 from .ndstorage_base import WritableNDStorageAPI, NDStorageBase
+
+from multiprocessing import Process
+import asyncio
+
+# Constants for writing files
+BYTES_PER_GIG = 1073741824
+MAX_FILE_SIZE = 4 * BYTES_PER_GIG
 
 class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
     """
@@ -21,7 +30,7 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
     """
 
     def __init__(self, dataset_path=None, file_io: NDTiffFileIO = BUILTIN_FILE_IO, summary_metadata=None,
-                 name=None, writable=False, compression_scheme = 1, **kwargs):
+                 name=None, writable=False, compression_scheme = 1, loop = None, **kwargs):
         """
         Provides access to an NDTiffStorage dataset,
         either one currently being acquired or one on disk
@@ -41,7 +50,13 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
             Whether it is a new dataset being written to disk
         """
         super().__init__()
-
+        
+        self.stupid_loop = asyncio.get_event_loop()
+        
+        self._loop = None
+        if not loop is None:
+            self._loop = loop
+        
         self.file_io = file_io
         self._lock = threading.RLock()
         self._new_file_lock = threading.Lock() # Lock for creating new file when current one is full
@@ -74,6 +89,11 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
             else:
                 self.path = dataset_path
                 self.path += "" if self.path[-1] == os.sep else os.sep
+                
+            self._init_first_file_writer()
+            self._allocate_next_thread=0
+            self._allocate_next_file()
+            
         else:
             self._write_pending_images = None
             self._writable = False
@@ -171,6 +191,50 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
 
             return self._do_read_metadata(axes)
 
+    def _init_first_file_writer(self):
+        filename = 'NDTiffStack.tif'
+        if self.name is not None:
+            filename = self.name + '_' + filename
+        if not self._loop is None:
+            self.current_writer = SingleNDTiffAsyncWriter(self.path, filename, self._summary_metadata, compression_scheme = self._compression_scheme, loop = self._loop)
+        else:
+            self.current_writer = SingleNDTiffWriter(self.path, filename, self._summary_metadata, compression_scheme = self._compression_scheme)
+        self.file_index += 1
+        #self._new_file_lock.release() # release lock after creating new file
+        # create the index file
+        self._index_file = open(os.path.join(self.path, "NDTiff.index"), "wb")
+            
+    def _init_next_file_writer(self):
+        self._allocate_next_thread.join() 
+        filename = 'NDTiffStack_{}.tif'.format(self.file_index)
+        if self.name is not None:
+            filename = self.name + '_' + filename
+        if not self._loop is None:
+            writer = SingleNDTiffAsyncWriter(self.path, filename, self._summary_metadata, compression_scheme = self._compression_scheme, loop = self._loop)
+        else:
+            writer = SingleNDTiffWriter(self.path, filename, self._summary_metadata, compression_scheme = self._compression_scheme)
+        self.file_index += 1
+        self._allocate_next_file()
+        return writer
+
+    def _allocate_next_file(self):
+        filename = 'NDTiffStack_{}.tif'.format(self.file_index)
+        if self.name is not None:
+            filename = self.name + '_' + filename
+        file_path = os.path.join(self.path, filename)
+        self._allocate_next_thread = Process(target=self._allocate_file, args=(file_path,))
+        self._allocate_next_thread.start()
+
+    def _allocate_file(self, file_path):
+        print(f"allocate file {file_path}")
+        with open(file_path, 'wb') as f:
+            f.seek(MAX_FILE_SIZE-1)
+            f.write(b'\0')
+            f.flush()
+            #temp_map = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_WRITE)
+            #temp_map.close()
+        print(f"file {file_path} allocated")
+
     def put_image(self, coordinates, image, metadata, compression_scheme = 0):
         if not self._writable:
             raise RuntimeError("Cannot write to a read-only dataset")
@@ -193,25 +257,18 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
         # Create a new file if needed
         self._new_file_lock.acquire() # acquire lock to prevent multiple threads from creating new files
         # the lock has to be acquired before checking if a new file is needed
-        if self.current_writer is None:
-            filename = 'NDTiffStack.tif'
-            if self.name is not None:
-                filename = self.name + '_' + filename
-            self.current_writer = SingleNDTiffWriter(self.path, filename, self._summary_metadata, compression_scheme = self._compression_scheme)
-            self.file_index += 1
-            #self._new_file_lock.release() # release lock after creating new file
-            # create the index file
-            self._index_file = open(os.path.join(self.path, "NDTiff.index"), "wb")
-        elif not self.current_writer.has_space_to_write(image, metadata):
+        if not self.current_writer.has_space_to_write(image, metadata):
             last_writer = self.current_writer # save the current writer to finish after new one is created
             
-            filename = 'NDTiffStack_{}.tif'.format(self.file_index)
-            if self.name is not None:
-                filename = self.name + '_' + filename
-            self.current_writer = SingleNDTiffWriter(self.path, filename, self._summary_metadata, compression_scheme = self._compression_scheme)
-            self.file_index += 1
-            #self._new_file_lock.release() # release lock after creating new file
+            start_time = time.time()
+            self.current_writer = self._init_next_file_writer()
+            print(f"next writer in {time.time()-start_time} s")
+            #self._init_next_file_writer()
+
+            start_time = time.time()
             last_writer.finished_writing() # finish writing to the last file
+            last_writer = None
+            print(f"finish writing in {time.time()-start_time} s")
         #if not self._new_file_lock.locked():
         #    self._new_file_lock.acquire() # acquire lock to prevent multiple threads from writing to the same file
         index_data_entry = self.current_writer.write_image(frozenset(coordinates.items()), image, metadata, compression_scheme=compression_scheme)
@@ -277,6 +334,7 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
                 self.index[frozenset(image_coordinates.items())] = index_entry
 
             if index_entry.filename not in self._readers_by_filename:
+                # avoid opening the same file multiple times
                 if index_entry.filename == self.current_writer.filename.split(os.sep)[-1]:
                     new_reader = self.current_writer.reader
                 else:

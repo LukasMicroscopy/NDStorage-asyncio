@@ -1,4 +1,5 @@
 import json
+import orjson
 import struct
 import warnings
 from collections import OrderedDict
@@ -31,6 +32,7 @@ class NDTiffIndexEntry:
 
     UNCOMPRESSED = 0
 
+    #__slots__ = 'axes_key', 'pix_offset', 'image_width', 'image_height', 'metadata_offset', 'metadata_length', 'pixel_type', 'pixel_compression', 'metadata_compression', 'filename', 'data_set_finished_entry'
     def __init__(self, axes_key, pixel_type, pix_offset, image_width, image_height, md_offset, md_length, filename, pixel_compression):
         self.axes_key = axes_key
         self.pix_offset = pix_offset
@@ -62,9 +64,9 @@ class NDTiffIndexEntry:
     def is_data_set_finished_entry(self):
         return self.data_set_finished_entry
 
-    def to_essential_image_metadata(self):
-        return EssentialImageMetadata(int(self.pix_width), int(self.pix_height),
-                                      self.get_bit_depth(), self.is_rgb())
+    #def to_essential_image_metadata(self):
+    #    return EssentialImageMetadata(int(self.pix_width), int(self.pix_height),
+    #                                  self.get_bit_depth(), self.is_rgb())
 
     @staticmethod
     def unsign_int(i):
@@ -100,8 +102,9 @@ class NDTiffIndexEntry:
                 "Index appears to not have been properly terminated (the dataset may still work)"
             )
             return None
-        axes_str = data[position + 4: position + 4 + axes_length].decode("utf-8")
-        axes = json.loads(axes_str)
+        #axes_str = data[position + 4: position + 4 + axes_length].decode("utf-8")
+        #axes = json.loads(axes_str)
+        axes = orjson.loads(data[position + 4: position + 4 + axes_length])
         position += axes_length + 4
         (filename_length,) = struct.unpack("I", data[position: position + 4])
         filename = data[position + 4: position + 4 + filename_length].decode("utf-8")

@@ -1,22 +1,20 @@
 import numpy as np
 import sys
-import json
+#import json
 import orjson
 import os
 import time
 import struct
 import zlib
-import mmap
 import warnings
 from collections import OrderedDict
 from io import BytesIO
 from .file_io import NDTiffFileIO, BUILTIN_FILE_IO
 from .ndtiff_index import NDTiffIndexEntry
+from aiofile import async_open
 
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-
-from multiprocessing import Process
 
 MAJOR_VERSION = 3
 MINOR_VERSION = 3
@@ -52,9 +50,9 @@ _Z_AXIS = "z"
 _TIME_AXIS = "time"
 _CHANNEL_AXIS = "channel"
 
-class SingleNDTiffWriter:
+class SingleNDTiffAsyncWriter:
 
-    def __init__(self, directory, filename, summary_md, compression_scheme = 1):
+    def __init__(self, directory, filename, summary_md, loop, compression_scheme = 1):
         self.filename = os.path.join(directory, filename)
         self.index_map = {}
         self.next_ifd_offset_location = -1
@@ -63,7 +61,8 @@ class SingleNDTiffWriter:
         self.z_step_um = 1
         self.buffers = deque()
         self.first_ifd = True
-        
+        self._loop = loop
+
         if compression_scheme == 1 or compression_scheme == 8:
             self.compression_scheme = compression_scheme
         else:
@@ -72,39 +71,22 @@ class SingleNDTiffWriter:
         self.start_time = None
 
         os.makedirs(directory, exist_ok=True)
-        
         # pre-allocate the file
-        start_time = time.time()
         file_path = os.path.join(directory, filename)
-        if not os.path.isfile(file_path):
-            print("File not allocated!")
-            self._allocate_file(file_path)
-            print(f"file generated in {time.time()-start_time} s")
-        # allocate_thread = Process(target=self._allocate_file, args=(file_path,))
-        # allocate_thread.start()
-        # allocate_thread.join()
-        
+        with open(file_path, 'wb') as f:
+            f.seek(MAX_FILE_SIZE - 1)
+            f.write(b'\0')
+            # f.flush() # does write the full file size with b'\0' to disc. This takes time.
+            # without flush the file is generated with the correct size but the file is not filled with b'\0'
+
         # reopen the file in binary mode
-        start_time = time.time()
-        self.file = open(file_path, 'rb+')
-        self.mmapf = mmap.mmap(self.file.fileno(), 0, prot=mmap.PROT_WRITE)
+        #await self.file = async_open(file_path, 'rb+')
+        self.file = self._loop.run_in_executor(None, async_open, (file_path, 'rb+'))
         # reset position to 0
-        self.mmapf.seek(0)
-        self.mmapf.madvise(mmap.MADV_SEQUENTIAL)
-        print(f"File opened in {time.time()-start_time} s")
+        self.file.seek(0)
 
         self._write_mm_header_and_summary_md(summary_md)
         self.reader = SingleNDTiffReader(self.filename, summary_md=summary_md)
-
-    def _allocate_file(self, file_path):
-        print(f"allocate file {file_path}")
-        with open(file_path, 'wb') as f:
-            f.seek(MAX_FILE_SIZE-1)
-            f.write(b'\0')
-            f.flush()
-            #temp_map = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_WRITE)
-            #temp_map.close()
-        print(f"file {file_path} allocated")
 
     def has_space_to_write(self, pixels, metadata):
         rgb = pixels.ndim == 3 and pixels.shape[2] == 3
@@ -113,13 +95,16 @@ class SingleNDTiffWriter:
         extra_padding = 5000000  # 5 MB extra padding
         bytes_per_pixels = self._bytes_per_image_pixels(pixels, rgb)
 
-        size = md_length + IFD_size + bytes_per_pixels + extra_padding + self.mmapf.tell()
+        size = md_length + IFD_size + bytes_per_pixels + extra_padding + self.file.tell()
 
         if size >= MAX_FILE_SIZE:
             return False
         return True
 
     def _write_mm_header_and_summary_md(self, summary_md):
+        self._loop.run_in_executor(None, self._async_write_mm_header_and_summary_md, summary_md)
+
+    async def _async_write_mm_header_and_summary_md(self, summary_md):
         #summary_md_bytes = self._get_bytes_from_string(json.dumps(summary_md))
         summary_md_bytes = orjson.dumps(summary_md)
         md_length = len(summary_md_bytes)
@@ -143,27 +128,33 @@ class SingleNDTiffWriter:
         struct.pack_into('<II', header_buffer, 20, SUMMARY_MD_HEADER, md_length)
 
         for buffer in [header_buffer, summary_md_bytes]:
-            self.mmapf.write(buffer)
+            await self.file.write(buffer)
 
     def _get_bytes_from_string(self, s):
         return s.encode('utf-8')
 
     def finished_writing(self):
+        self._loop.run-in_executor(None, self._async_finished_writing, None)
+    
+    async def _async_finished_writing(self):
         self._write_null_offset_after_last_image()
-        self.mmapf.flush()
-        self.mmapf.close()
         self.file.truncate()
-        self.file.close()
+        #self.file.flush()
+        await self.file.fsync()
+        await self.file.close()
 
-    def _write_null_offset_after_last_image(self):
+    async def _write_null_offset_after_last_image(self):
         buffer = bytearray(4)
         struct.pack_into('<I', buffer, 0, 0)
-        current_pos = self.mmapf.tell()
-        self.mmapf.seek(self.next_ifd_offset_location)
-        self.mmapf.write(buffer)
-        self.mmapf.seek(current_pos)
+        current_pos = self.file.tell()
+        self.file.seek(self.next_ifd_offset_location)
+        await self.file.write(buffer)
+        self.file.seek(current_pos)
 
     def write_image(self, index_key, pixels, metadata, bit_depth='auto', compression_scheme = 0):
+        return self._loop.run_in_executor(None, self._async_write_image, (self, index_key, pixels, metadata, bit_depth, compression_scheme))
+
+    async def _async_write_image(self, index_key, pixels, metadata, bit_depth='auto', compression_scheme = 0):
         """
         Write an image to the file
 
@@ -199,21 +190,22 @@ class SingleNDTiffWriter:
             bit_depth = 8 if pixels.dtype == np.uint8 else 16
         # if metadata is a dict, serialize it to a json string and make it a utf8 byte buffer
         if isinstance(metadata, dict):
-            #metadata = self._get_bytes_from_string(json.dumps(metadata))
             metadata = orjson.dumps(metadata)
+            #metadata = self._get_bytes_from_string(json.dumps(metadata))
         ied = self._write_ifd(index_key, pixels, metadata, rgb, image_height, image_width, bit_depth, compression_scheme)
         while self.buffers:
-            self.mmapf.write(self.buffers.popleft())
+            await self.file.write(self.buffers.popleft())
         # make sure the file is flushed to disk
-        self.mmapf.flush()
+        #self.file.flush()
+        await self.file.fdsync()
         self.index_map[index_key] = ied
         return ied
 
 
     def _write_ifd(self, index_key, pixels, metadata, rgb, image_height, image_width, bit_depth, compression_scheme):
-        if self.mmapf.tell() % 2 == 1:
-            #self.mmapf.seek(self.mmapf.tell() + 1)  # Make IFD start on word
-            self.mmapf.write(b'\0') # Make IFD start on word, by writing a null byte (equal to +1) to the file, since the file is not initialized with null bytes
+        if self.file.tell() % 2 == 1:
+            #self.file.seek(self.file.tell() + 1)  # Make IFD start on word
+            self.file.write(b'\0') # Make IFD start on word, by writing a null byte (equal to +1) to the file, since the file is not initialized with null bytes
 
         byte_depth = 1 if isinstance(pixels, bytearray) else 2
         if bit_depth == 8:
@@ -232,7 +224,7 @@ class SingleNDTiffWriter:
         ifd_and_small_vals_buffer = bytearray(ifd_and_bit_depth_bytes)
 
         # Needed to reset to zero after last IFD
-        self.next_ifd_offset_location = self.mmapf.tell() + 2 + num_entries * 12
+        self.next_ifd_offset_location = self.file.tell() + 2 + num_entries * 12
         bits_per_sample_offset = self.next_ifd_offset_location + 4
         x_resolution_offset = bits_per_sample_offset + (6 if rgb else 0)
         y_resolution_offset = x_resolution_offset + 8
@@ -336,7 +328,7 @@ class SingleNDTiffWriter:
                 raise RuntimeError("unknown pixel type")
 
 
-class SingleNDTiffReader:
+class SingleNDTiffAsyncReader:
     """
     Class corresponsing to a single multipage tiff file
     Pass the full path of the TIFF to instantiate and call close() when finished
@@ -365,12 +357,9 @@ class SingleNDTiffReader:
         summary_md: dict
             If not None, this corresponds to a file that is actively being written to by an associated writer
         """
-        self.mmapf_io = file_io
+        self.file_io = file_io
         self.tiff_path = tiff_path
-        #self.mmapf = self.mmapf_io.open(tiff_path, "rb")
-        self.file = self.mmapf_io.open(tiff_path, "rb")
-        # much faster for random reads
-        self.mmapf = mmap.mmap(self.file.fileno(), 0, prot=mmap.PROT_READ)
+        self.file = self.file_io.open(tiff_path, "rb")
         if summary_md is None:
             self.summary_md, self.first_ifd_offset = self._read_header()
         else:
@@ -380,7 +369,6 @@ class SingleNDTiffReader:
 
     def close(self):
         """ """
-        self.mmapf.close()
         self.file.close()
 
     def _read_header(self):
@@ -416,14 +404,15 @@ class SingleNDTiffReader:
         if summary_md_header != self.SUMMARY_MD_HEADER:
             raise Exception("Summary metadata header wrong")
         summary_md = orjson.loads(self._read(28, 28 + summary_md_length))
+        #summary_md = json.loads(self._read(28, 28 + summary_md_length))
         return summary_md, first_ifd_offset
 
     def _read(self, start, end):
         """
         convert to python ints
         """
-        self.mmapf.seek(int(start), 0)
-        return self.mmapf.read(end - start)
+        self.file.seek(int(start), 0)
+        return self.file.read(end - start)
 
     def read_metadata(self, index):
         return orjson.loads(
