@@ -14,6 +14,9 @@ from .ndtiff_index import NDTiffIndexEntry
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
+import asyncio
+from aiofiles import async_open
+
 MAJOR_VERSION = 3
 MINOR_VERSION = 3
 
@@ -65,6 +68,7 @@ class SingleNDTiffWriter:
         else:
             raise ValueError("Invalid pixel compression, only 1 (no compression) and 8 (zlib) are supported")
 
+        self.use_async = False
         self.start_time = None
         
         os.makedirs(directory, exist_ok=True)
@@ -312,6 +316,38 @@ class SingleNDTiffWriter:
             else:
                 raise RuntimeError("unknown pixel type")
 
+class SingleNDTiffAsyncWriter(SingleNDTiffWriter):
+    
+    __init__(self, directory, filename, summary_md, loop, pixel_compression = 1):
+        #super().__init__(self, directory, filename, summary_md, pixel_compression):
+
+        self.filename = os.path.join(directory, filename)
+        self.index_map = {}
+        self.next_ifd_offset_location = -1
+        self.res_numerator = 1
+        self.res_denominator = 1
+        self.z_step_um = 1
+        self.buffers = deque()
+        self.first_ifd = True
+
+        if pixel_compression in [1, 8]:
+            self.pixel_compression = pixel_compression
+        else:
+            raise ValueError("Invalid pixel compression, only 1 (no compression) and 8 (zlib) are supported")
+
+        self._loop = loop
+        self.use_async = True
+        self.start_time = None
+        
+        os.makedirs(directory, exist_ok=True)
+        # pre-allocate the file 
+        file_path = os.path.join(directory, filename)
+        self.file = await async_open(file_path "rb+")
+        await self.file.seek(0)
+
+        self._write_mm_header_and_summary_md(summary_md)
+        self.reader = SingleNDTiffReader(self.filename, summary_md=summary_md)
+        
 
 class SingleNDTiffReader:
     """

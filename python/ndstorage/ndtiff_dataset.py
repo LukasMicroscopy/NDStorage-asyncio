@@ -42,6 +42,8 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
         """
         super().__init__()
 
+        self._use_async = False
+
         self.file_io = file_io
         self._lock = threading.RLock()
         self._put_file_lock = threading.Lock()
@@ -171,6 +173,29 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
 
             return self._do_read_metadata(axes)
 
+    def _init_first_writer(self):
+        filename = 'NDTiffStack.tif'
+        if self.name is not None:
+            filename = self.name + '_' + filename
+        if self._use_async:
+            self.current_writer = SingleNDTiffAsyncWriter(self.path, filename, self._summary_metadata, self._loop, self._pixel_compression)
+        else:
+            self.current_writer = SingleNDTiffWriter(self.path, filename, self._summary_metadata, self._pixel_compression)
+        self.file_index += 1
+        # create the index file
+        self._index_file = open(os.path.join(self.path, "NDTiff.index"), "wb")
+
+    def _init_next_writer(self):
+        self.current_writer.finished_writing()
+        filename = 'NDTiffStack_{}.tif'.format(self.file_index)
+        if self.name is not None:
+            filename = self.name + '_' + filename
+        if self._use_async:
+            self.current_writer = SingleNDTiffAsyncWriter(self.path, filename, self._summary_metadata, self._loop, self._pixel_compression)
+        else:
+            self.current_writer = SingleNDTiffWriter(self.path, filename, self._summary_metadata, self._pixel_compression)
+        self.file_index += 1
+
     def put_image(self, coordinates, image, metadata, pixel_compression = 0):
         self._put_file_lock.acquire()
         
@@ -195,20 +220,9 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
 
         # Create a new file if needed
         if self.current_writer is None:
-            filename = 'NDTiffStack.tif'
-            if self.name is not None:
-                filename = self.name + '_' + filename
-            self.current_writer = SingleNDTiffWriter(self.path, filename, self._summary_metadata, self._pixel_compression)
-            self.file_index += 1
-            # create the index file
-            self._index_file = open(os.path.join(self.path, "NDTiff.index"), "wb")
+            self._init_first_writer()
         elif not self.current_writer.has_space_to_write(image, metadata):
-            self.current_writer.finished_writing()
-            filename = 'NDTiffStack_{}.tif'.format(self.file_index)
-            if self.name is not None:
-                filename = self.name + '_' + filename
-            self.current_writer = SingleNDTiffWriter(self.path, filename, self._summary_metadata, self._pixel_compression)
-            self.file_index += 1
+            self._init_next_writer()
 
         index_data_entry = self.current_writer.write_image(frozenset(coordinates.items()), image, metadata, pixel_compression = pixel_compression)
         # create readers and update axes
@@ -384,7 +398,38 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
         for reader in self._readers_by_filename.values():
             reader.close()
 
+class NDTiffAsyncDataset(DTiffDataset):
+    __init__(self, dataset_path=None, file_io: NDTiffFileIO = BUILTIN_FILE_IO, summary_metadata=None,
+                 name=None, writable=False, pixel_compression = 1, loop = None, **kwargs):
+        super().__init__(self, dataset_path, file_io, summary_metadata,
+                 name, writable, pixel_compression, **kwargs):
+        
+        self._use_async = True
+        self._loop = loop
+        if loop is None:
+            try:
+                self._loop = asyncio.get_running_loop()
+            except:
+                self._loop = asyncio.get_event_loop()
+                self._loop_thread = None
+                self._start_loop_thread()
+        
+    self._start_loop_thread(self):
+        """ Use a context manager to manage the thread's lifecycle"""
+        self._loop_thread = Thread(target=self._run_event_loop, args=(self._loop,))
+        self._loop_thread.daemon = True
+        self._loop_thread.start()
 
+    self._stop_loop_thread(self):
+        self._loop.stop()
+        try:
+            self._loop_thread.join(timeout=10)
+        except TimeoutError:
+            warnings.warn("End AsyncIO Loop toolk more than 10 seconds!")
+        
+    self._run_event_loop(self):
+        self._loop.run_forever()
+        
 
 def _create_unique_acq_dir(root, prefix):
     if not os.path.exists(root):
