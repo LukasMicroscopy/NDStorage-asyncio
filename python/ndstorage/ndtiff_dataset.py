@@ -5,6 +5,7 @@ import time
 import numpy as np
 import warnings
 import re
+from collections import deque
 
 from .file_io import NDTiffFileIO, BUILTIN_FILE_IO
 from .ndtiff_file import SingleNDTiffReader
@@ -406,6 +407,7 @@ class NDTiffAsyncDataset(DTiffDataset):
         
         self._use_async = True
         self._loop = loop
+        self._put_image_deque = deque()
         if loop is None:
             try:
                 self._loop = asyncio.get_running_loop()
@@ -429,6 +431,14 @@ class NDTiffAsyncDataset(DTiffDataset):
         
     self._run_event_loop(self):
         self._loop.run_forever()
+        
+    def put_image_in_queue(self, coordinates, image, metadata, pixel_compression = 0):
+        # make things easy for users who don't want to write their one threading
+        if self._put_image_deque:
+            warnings.warn("Last image not processed yet!")
+            while self._put_image_deque:
+                time.sleep(0.0001)
+        self._put-image_deque.put((coordinates, image, metadata, pixel_compression))
         
 
 def _create_unique_acq_dir(root, prefix):
