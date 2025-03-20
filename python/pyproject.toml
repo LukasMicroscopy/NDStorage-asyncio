@@ -14,7 +14,8 @@ classifiers = [
 dependencies = [
     "numpy",
     "sortedcontainers",
-    "dask[array]>=2022.2.0"
+    "dask[array]>=2022.2.0",
+    "aiofile"
 ]
 dynamic = ["version"]
 

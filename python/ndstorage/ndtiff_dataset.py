@@ -3,6 +3,7 @@ import threading
 import time
 
 import numpy as np
+import asyncio
 import warnings
 import re
 from collections import deque
@@ -12,7 +13,7 @@ from .ndtiff_file import SingleNDTiffReader
 from .ndtiff_file import _CHANNEL_AXIS
 from .ndtiff_index import NDTiffIndexEntry, read_ndtiff_index
 
-from .ndtiff_file import SingleNDTiffWriter, MAJOR_VERSION, MINOR_VERSION
+from .ndtiff_file import SingleNDTiffWriter, SingleNDTiffAsyncWriter, MAJOR_VERSION, MINOR_VERSION, MAX_FILE_SIZE
 
 from .ndstorage_base import WritableNDStorageAPI, NDStorageBase
 
@@ -178,10 +179,7 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
         filename = 'NDTiffStack.tif'
         if self.name is not None:
             filename = self.name + '_' + filename
-        if self._use_async:
-            self.current_writer = SingleNDTiffAsyncWriter(self.path, filename, self._summary_metadata, self._loop, self._pixel_compression)
-        else:
-            self.current_writer = SingleNDTiffWriter(self.path, filename, self._summary_metadata, self._pixel_compression)
+        self.current_writer = SingleNDTiffWriter(self.path, filename, self._summary_metadata, self._pixel_compression)
         self.file_index += 1
         # create the index file
         self._index_file = open(os.path.join(self.path, "NDTiff.index"), "wb")
@@ -191,10 +189,7 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
         filename = 'NDTiffStack_{}.tif'.format(self.file_index)
         if self.name is not None:
             filename = self.name + '_' + filename
-        if self._use_async:
-            self.current_writer = SingleNDTiffAsyncWriter(self.path, filename, self._summary_metadata, self._loop, self._pixel_compression)
-        else:
-            self.current_writer = SingleNDTiffWriter(self.path, filename, self._summary_metadata, self._pixel_compression)
+        self.current_writer = SingleNDTiffWriter(self.path, filename, self._summary_metadata, self._pixel_compression)
         self.file_index += 1
 
     def put_image(self, coordinates, image, metadata, pixel_compression = 0):
@@ -218,7 +213,7 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
 
         # Update viewer as soon as image is ready in RAM
         self._new_image_event.set()
-
+        
         # Create a new file if needed
         if self.current_writer is None:
             self._init_first_writer()
@@ -226,6 +221,7 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
             self._init_next_writer()
 
         index_data_entry = self.current_writer.write_image(frozenset(coordinates.items()), image, metadata, pixel_compression = pixel_compression)
+
         # create readers and update axes
         self.add_index_entry(index_data_entry, new_image_updates=False)
         # write the index to disk
@@ -399,48 +395,99 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
         for reader in self._readers_by_filename.values():
             reader.close()
 
-class NDTiffAsyncDataset(DTiffDataset):
-    __init__(self, dataset_path=None, file_io: NDTiffFileIO = BUILTIN_FILE_IO, summary_metadata=None,
+class NDTiffAsyncDataset(NDTiffDataset):
+    
+    def __init__(self, dataset_path=None, file_io: NDTiffFileIO = BUILTIN_FILE_IO, summary_metadata=None,
                  name=None, writable=False, pixel_compression = 1, loop = None, **kwargs):
-        super().__init__(self, dataset_path, file_io, summary_metadata,
-                 name, writable, pixel_compression, **kwargs):
+        super().__init__(dataset_path, file_io, summary_metadata,
+                 name, writable, pixel_compression, **kwargs)
         
         self._use_async = True
         self._loop = loop
+        self._local_loop = False
+        self._loop_thread = None
+        
+        # thread put image
         self._put_image_deque = deque()
+        self._put_image_thread: threading.Thread = None
+        
         if loop is None:
             try:
                 self._loop = asyncio.get_running_loop()
+                self._local_loop = False
             except:
                 self._loop = asyncio.get_event_loop()
-                self._loop_thread = None
                 self._start_loop_thread()
+                self._local_loop = True
+        else:
+            if loop.is_running():
+                self._loop = loop
+                self._local_loop = False
+            else:
+                raise ValueError("Given loop is not a running asyncio event loop!")
         
-    self._start_loop_thread(self):
+    def _start_loop_thread(self):
         """ Use a context manager to manage the thread's lifecycle"""
-        self._loop_thread = Thread(target=self._run_event_loop, args=(self._loop,))
+        self._loop_thread = threading.Thread(target=self._run_event_loop)
         self._loop_thread.daemon = True
         self._loop_thread.start()
 
-    self._stop_loop_thread(self):
-        self._loop.stop()
-        try:
-            self._loop_thread.join(timeout=10)
-        except TimeoutError:
-            warnings.warn("End AsyncIO Loop toolk more than 10 seconds!")
+    def _stop_loop_thread(self):
+        # only do if everything else is closed!
+        if not self._loop_thread is None:
+            self._loop.stop()
+            try:
+                self._loop_thread.join(timeout=10)
+            except TimeoutError:
+                warnings.warn("End AsyncIO Loop toolk more than 10 seconds!")
         
-    self._run_event_loop(self):
+    def _run_event_loop(self):
         self._loop.run_forever()
         
-    def put_image_in_queue(self, coordinates, image, metadata, pixel_compression = 0):
+    def put_image_threaded(self, coordinates, image, metadata, pixel_compression = 0):
         # make things easy for users who don't want to write their one threading
         if self._put_image_deque:
             warnings.warn("Last image not processed yet!")
             while self._put_image_deque:
                 time.sleep(0.0001)
-        self._put-image_deque.put((coordinates, image, metadata, pixel_compression))
+        self._put_image_deque.append((coordinates, image, metadata, pixel_compression))
+        if not self._put_image_thread is None:
+            self._put-image_thread.join()
+        self._put_image_thread = threading.Thread(target=self._process_image)
         
+    def _process_image(self):
+        coordinates, image, metadata, pixel_compression = self._put_image_deque.popleft()
+        self.put_image(coordinates, image, metadata, pixel_compression)
+    
+    async def _preallocate_file(directory, filename):
+        # preallocate a file with MAX_FILE_SIZE
+        pass
+        
+    def _init_first_writer(self):
+        filename = 'NDTiffStack.tif'
+        if self.name is not None:
+            filename = self.name + '_' + filename
+        self.current_writer = SingleNDTiffAsyncWriter(self.path, filename, self._summary_metadata, self._loop, self._pixel_compression)
+        #future = asyncio.run_coroutine_threadsafe(self._init_current_writer(filename), self._loop)
+        #asyncio.wait_for(future, None)
+        self.file_index += 1
+        # create the index file
+        self._index_file = open(os.path.join(self.path, "NDTiff.index"), "wb")
 
+    def _init_next_writer(self):
+        self.current_writer.finished_writing()
+        filename = 'NDTiffStack_{}.tif'.format(self.file_index)
+        if self.name is not None:
+            filename = self.name + '_' + filename
+        self.current_writer = SingleNDTiffAsyncWriter(self.path, filename, self._summary_metadata, self._loop, self._pixel_compression)
+        #future = asyncio.run_coroutine_threadsafe(self._init_current_writer(filename), self._loop)
+        #asyncio.wait_for(future, None)
+        self.file_index += 1
+
+    # async def _init_current_writer(self, filename):
+    #     self.current_writer = SingleNDTiffAsyncWriter(self.path, filename, self._summary_metadata, self._loop, self._pixel_compression)
+    #     await self.current_writer.init_file()
+    
 def _create_unique_acq_dir(root, prefix):
     if not os.path.exists(root):
         os.makedirs(root)
