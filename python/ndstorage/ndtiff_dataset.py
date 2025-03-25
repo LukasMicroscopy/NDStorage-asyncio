@@ -194,7 +194,6 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
 
     def put_image(self, coordinates, image, metadata, pixel_compression = 0):
         self._put_file_lock.acquire()
-        
         if not self._writable:
             raise RuntimeError("Cannot write to a read-only dataset")
 
@@ -296,8 +295,6 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
                 self._update_axes(image_coordinates)
                 self._update_channel_names(image_coordinates)
                 self._new_image_event.set()
-
-
 
         return image_coordinates
 
@@ -404,60 +401,17 @@ class NDTiffAsyncDataset(NDTiffDataset):
         
         self._use_async = True
         self._loop = loop
-        self._local_loop = False
-        self._loop_thread = None
-        
-        # thread put image
-        self._put_image_deque = deque()
-        self._put_image_thread: threading.Thread = None
         
         if loop is None:
             try:
                 self._loop = asyncio.get_running_loop()
-                self._local_loop = False
             except:
-                self._loop = asyncio.get_event_loop()
-                self._start_loop_thread()
-                self._local_loop = True
+                raise ValueError("No running asyncio event loop!")
         else:
             if loop.is_running():
                 self._loop = loop
-                self._local_loop = False
             else:
                 raise ValueError("Given loop is not a running asyncio event loop!")
-        
-    def _start_loop_thread(self):
-        """ Use a context manager to manage the thread's lifecycle"""
-        self._loop_thread = threading.Thread(target=self._run_event_loop)
-        self._loop_thread.daemon = True
-        self._loop_thread.start()
-
-    def _stop_loop_thread(self):
-        # only do if everything else is closed!
-        if not self._loop_thread is None:
-            self._loop.stop()
-            try:
-                self._loop_thread.join(timeout=10)
-            except TimeoutError:
-                warnings.warn("End AsyncIO Loop toolk more than 10 seconds!")
-        
-    def _run_event_loop(self):
-        self._loop.run_forever()
-        
-    def put_image_threaded(self, coordinates, image, metadata, pixel_compression = 0):
-        # make things easy for users who don't want to write their one threading
-        if self._put_image_deque:
-            warnings.warn("Last image not processed yet!")
-            while self._put_image_deque:
-                time.sleep(0.0001)
-        self._put_image_deque.append((coordinates, image, metadata, pixel_compression))
-        if not self._put_image_thread is None:
-            self._put-image_thread.join()
-        self._put_image_thread = threading.Thread(target=self._process_image)
-        
-    def _process_image(self):
-        coordinates, image, metadata, pixel_compression = self._put_image_deque.popleft()
-        self.put_image(coordinates, image, metadata, pixel_compression)
     
     async def _preallocate_file(directory, filename):
         # preallocate a file with MAX_FILE_SIZE
@@ -468,25 +422,160 @@ class NDTiffAsyncDataset(NDTiffDataset):
         if self.name is not None:
             filename = self.name + '_' + filename
         self.current_writer = SingleNDTiffAsyncWriter(self.path, filename, self._summary_metadata, self._loop, self._pixel_compression)
-        #future = asyncio.run_coroutine_threadsafe(self._init_current_writer(filename), self._loop)
-        #asyncio.wait_for(future, None)
+        print("fuck off writer")
+        #task = asyncio.eager_task_factory(self._loop, self._init_current_writer(filename))
+        #asyncio.wait_for(task, None)
         self.file_index += 1
         # create the index file
         self._index_file = open(os.path.join(self.path, "NDTiff.index"), "wb")
 
     def _init_next_writer(self):
+        print("second dudl")
         self.current_writer.finished_writing()
         filename = 'NDTiffStack_{}.tif'.format(self.file_index)
         if self.name is not None:
             filename = self.name + '_' + filename
         self.current_writer = SingleNDTiffAsyncWriter(self.path, filename, self._summary_metadata, self._loop, self._pixel_compression)
-        #future = asyncio.run_coroutine_threadsafe(self._init_current_writer(filename), self._loop)
-        #asyncio.wait_for(future, None)
         self.file_index += 1
 
-    # async def _init_current_writer(self, filename):
+    async def _init_current_writer(self, filename):
     #     self.current_writer = SingleNDTiffAsyncWriter(self.path, filename, self._summary_metadata, self._loop, self._pixel_compression)
     #     await self.current_writer.init_file()
+        try:
+            self.current_writer = SingleNDTiffAsyncWriter(self.path, filename, self._summary_metadata, self._loop, self._pixel_compression)
+            await self.current_writer._open_file()
+        except Exception as e:
+            print(e)
+            raise e
+
+    async def finish(self):
+        if self.current_writer is not None:
+            await self.current_writer.finished_writing()
+            self.current_writer = None
+        if self._index_file is not None: # if no images were written, it never got opened
+            self._index_file.close()
+        self._finished_event.set()
+
+class NDTiffSyncToAsyncWriter():
+    def __init__(self, dataset_path=None, summary_metadata=None, name=None, writable=True, pixel_compression = 1):
+
+        self.dataset_path = dataset_path
+        self.summary_metadata = summary_metadata
+        self.name = name
+        self.pixel_compression = pixel_compression
+        
+        self.path = dataset_path
+        # if writable and name is not None:
+        #     # create a folder to hold the new Tiff files
+        #     self.path = _create_unique_acq_dir(dataset_path, name)
+        # else:
+        #     self.path = dataset_path
+        #     self.path += "" if self.path[-1] == os.sep else os.sep
+    
+        self._write_buffer = deque()
+    
+        self._finish_dataset_event = threading.Event()
+        self._finished_event = threading.Event()
+        self._get_index_event = threading.Event()
+    
+        self._async_thread = None
+        self._async_main_running = threading.Event()
+        self._start_async_loop()
+        self._loop = None
+    
+    def _start_async_loop(self):
+        self._async_main_running.set()
+        self._finish_dataset_event.clear()
+        self._finished_event.clear()
+        self._get_index_event.clear()
+        self._async_thread = threading.Thread(target=self._async_loop)
+        self._async_thread.start()
+    
+    def _stop_async_loop(self):
+        self._async_main_running.clear()
+        self._async_thread.join()
+    
+    def is_running(self):
+        return self._async_thread.is_alive()
+    
+    def _async_loop(self):
+        asyncio.run(self._async_main())
+    
+    def put_image(self, coordinates, image, metadata, pixel_compression = 0):
+        if self._write_buffer:
+            warnings.warn("Last image not processed yet!")
+            while self._write_buffer:
+                time.sleep(0.0001)
+        self._write_buffer.append([coordinates, image, metadata, pixel_compression])
+    
+    def get_channel_names(self):
+        """
+        :return: list of channel names (strings)
+        """
+        return list(self._channels.keys())
+
+    def has_image(self, channel=None, z=None, time=None, position=None, row=None, column=None, **kwargs):
+        pass
+
+    def read_image(self, channel=None, z=None, time=None, position=None, row=None, column=None, **kwargs):
+        pass
+
+    def read_metadata(self, channel=None, z=None, time=None, position=None, row=None, column=None, **kwargs):
+        pass
+    
+    def finish(self):
+        self._finish_dataset_event.set()
+
+    def is_finished(self) -> bool:
+        return self._finished_event.is_set()
+
+    def initialize(self, summary_metadata: dict):
+        warnings.warn("Not implemented in NDTiffSyncToAsyncWriter!")
+
+    def block_until_finished(self, timeout=None):
+        return self._finished_event.wait(timeout=timeout)
+
+    def get_image_coordinates_list(self):
+        pass
+
+    def add_index_entry(self, data, new_image_updates=True):
+        warnings.warn("Not implemented in NDTiffSyncToAsyncWriter!")
+
+    async def print_test():
+        print('TART THIS!')
+        await asyncio.sleep(1)
+        print('Did sleep :-)')
+        return "Did run Test"
+
+    async def _async_main(self):
+        
+        #self._loop = asyncio.get_running_loop()
+        #task = asyncio.eager_task_factory(self._loop, self.print_test)
+        
+        ndtiff_dataset = NDTiffAsyncDataset(dataset_path=self.dataset_path, summary_metadata=self.summary_metadata,
+                 name=self.name, writable=True, pixel_compression = self.pixel_compression)
+        
+        while self._async_main_running.is_set():
+            if self._write_buffer:
+                coordinates, image, metadata, pixel_compression = self._write_buffer.popleft()
+                print("put image")
+                await ndtiff_dataset.put_image(coordinates, image, metadata, pixel_compression)
+                print("did image")
+            else:
+                await asyncio.sleep(0.001)
+            
+            if self._finish_dataset_event.is_set():
+                await ndtiff_dataset.finish()
+                
+        print("bththththt")
+        
+    
+    
+    
+    
+    
+    
+    
     
 def _create_unique_acq_dir(root, prefix):
     if not os.path.exists(root):

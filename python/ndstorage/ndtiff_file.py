@@ -69,11 +69,15 @@ class SingleNDTiffWriter:
             raise ValueError("Invalid pixel compression, only 1 (no compression) and 8 (zlib) are supported")
 
         self.use_async = False
-        self.start_time = None
         
-        os.makedirs(directory, exist_ok=True)
+        os.makedirs(directory, exist_ok=True)      
+        self.file = None
+        self.reader = None
+        self._open_file()
+        
+    def _open_file(self):
+        
         # pre-allocate the file 
-        #file_path = os.path.join(directory, filename)
         with open(self.filename, 'wb') as f:
             f.seek(MAX_FILE_SIZE - 1)
             f.write(b'\0')
@@ -166,6 +170,7 @@ class SingleNDTiffWriter:
         NDTiffIndexEntry
             The index entry for the image
         """
+        print("write the image")
         if pixel_compression == 0:
             pixel_compression == self.pixel_compression
         
@@ -188,7 +193,7 @@ class SingleNDTiffWriter:
         self._is_ready()
 
         ied = self._write_ifd(index_key, pixels, metadata, rgb, image_height, image_width, bit_depth, pixel_compression)
-        
+        print("uhaahaha")
         self._write_buffers()
         self.index_map[index_key] = ied
         return ied
@@ -334,7 +339,7 @@ class SingleNDTiffWriter:
 class SingleNDTiffAsyncWriter(SingleNDTiffWriter):
     
     def __init__(self, directory, filename, summary_md, loop, pixel_compression = 1):
-        #super().__init__(self, directory, filename, summary_md, pixel_compression):
+        #super().__init__(directory, filename, summary_md, pixel_compression):
 
         self.directory = directory
         self.filename = os.path.join(directory, filename)
@@ -361,21 +366,37 @@ class SingleNDTiffAsyncWriter(SingleNDTiffWriter):
         self.reader = None
         
         os.makedirs(self.directory, exist_ok=True)
-        future = asyncio.run_coroutine_threadsafe(self._open_file(), self._loop)
+        
+        self.file = None
+        task = asyncio.eager_task_factory(self._loop, self._open_file())
+        #self.file = await shield(task)
+        #self.file = await asyncio.wait_for(self._open_file(), None)
         #asyncio.wait_for(future, None)
-        self.file = future.result()
-        self.file.seek(0)
+        print("bis hier!")
+        print(self._loop)
+        #task = asyncio.create_task(self._open_file())
+        #future = asyncio.run_coroutine_threadsafe(self._open_file(), self._loop)
+        #while not task.done():
+        time.sleep(30)
+        print(f"task allive: {task.done()}")
+        #asyncio.wait_for(task, None)
+        #self.file = future.result()
+        self.file = task.result()
+        #self.file.seek(0)
         
         self._write_mm_header_and_summary_md(summary_md)
-        self.reader = SingleNDTiffReader(self.filename, summary_md=summary_md)
+        #self.reader = SingleNDTiffReader(self.filename, summary_md=summary_md)
         
     async def _open_file(self):
-        file = await async_open(self.filename, mode='wb')
+        file = async_open(self.filename, mode = 'wb' )
         file.seek(MAX_FILE_SIZE - 1)
+        print("write")
         file.write(b'\0')
-        file.flush()
-        file.seek(0)
-        return file
+        print("flush")
+        await self.file.flush()
+        print("reset pointer")
+        self.file.seek(0)
+        return self.file
     
     def _wait_for_last_write(self):
         if not self._last_write_future is None:
@@ -383,7 +404,8 @@ class SingleNDTiffAsyncWriter(SingleNDTiffWriter):
     
     def _write_bytes(self, bytes_to_write):
         self._wait_for_last_write()
-        self._last_write_future = asyncio.run_coroutine_threadsafe(self._async_write_bytes(bytes(bytes_to_write)), self._loop)
+        #self._last_write_future = asyncio.run_coroutine_threadsafe(self._async_write_bytes(bytes(bytes_to_write)), self._loop)
+        self._last_write_future = asyncio.eager_task_factory(self._loop, self._async_write_bytes(bytes(bytes_to_write)))
         self._wait_for_last_write()
             
     async def _async_write_bytes(self, bytes_to_write):
@@ -394,7 +416,8 @@ class SingleNDTiffAsyncWriter(SingleNDTiffWriter):
         
     def _write_buffers(self):
         self._wait_for_last_write()
-        self._last_write_future = asyncio.run_coroutine_threadsafe(self._async_write_buffers(), self._loop)
+        #self._last_write_future = asyncio.run_coroutine_threadsafe(self._async_write_buffers(), self._loop)
+        self._last_write_future = asyncio.eager_task_factory(self._loop, self._async_write_buffers())
         time.sleep(0.001)
         #self._wait_for_last_write()
     
@@ -410,10 +433,11 @@ class SingleNDTiffAsyncWriter(SingleNDTiffWriter):
         await self.file.flush(sync_metadata = True)
         return bytes_written
         
-    def finished_writing(self):
+    async def finished_writing(self):
         self._wait_for_last_write()
         self._write_null_offset_after_last_image()
-        self._last_write_future = asyncio.run_coroutine_threadsafe(self._async_finished_writing(), self._loop)
+        await self._async_finish_writing()
+        #self._last_write_future = asyncio.run_coroutine_threadsafe(self._async_finished_writing(), self._loop)
         
     async def _async_finished_writing(self):
         self.file.truncate()
