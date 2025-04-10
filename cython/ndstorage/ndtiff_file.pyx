@@ -1,3 +1,11 @@
+
+# cython: language_level=3
+# distutils: language=c++
+
+cimport cython
+from libcpp.deque cimport deque as cdeque
+from libc.stdio cimport fopen, fclose, fwrite, fread, fseek, ftell, FILE, SEEK_SET, SEEK_CUR, SEEK_END
+
 import numpy as np
 import sys
 import json
@@ -7,49 +15,64 @@ import struct
 import warnings
 import mmap
 import zlib
+
 from collections import OrderedDict
 from io import BytesIO
 from .file_io import NDTiffFileIO, BUILTIN_FILE_IO
 from .ndtiff_index import NDTiffIndexEntry
 
 from collections import deque
+
 from concurrent.futures import ThreadPoolExecutor
 
-MAJOR_VERSION = 3
-MINOR_VERSION = 3
+cdef const int MAJOR_VERSION = 3
+cdef const int MINOR_VERSION = 3
 
 # Constants for writing files
-BYTES_PER_GIG = 1073741824
-MAX_FILE_SIZE = 4 * BYTES_PER_GIG
+cdef const int BYTES_PER_GIG = 1073741824
+cdef const int MAX_FILE_SIZE = 4 * BYTES_PER_GIG
 
-ENTRIES_PER_IFD = 13
+cdef const int ENTRIES_PER_IFD = 13
+
 # Required tags
-WIDTH = 256
-HEIGHT = 257
-BITS_PER_SAMPLE = 258
-COMPRESSION = 259
-PHOTOMETRIC_INTERPRETATION = 262
-IMAGE_DESCRIPTION = 270
-STRIP_OFFSETS = 273
-SAMPLES_PER_PIXEL = 277
-ROWS_PER_STRIP = 278
-STRIP_BYTE_COUNTS = 279
-X_RESOLUTION = 282
-Y_RESOLUTION = 283
-RESOLUTION_UNIT = 296
-MM_METADATA = 51123
+cdef const int WIDTH = 256
+cdef const int HEIGHT = 257
+cdef const int BITS_PER_SAMPLE = 258
+cdef const int COMPRESSION = 259
+cdef const int PHOTOMETRIC_INTERPRETATION = 262
+cdef const int IMAGE_DESCRIPTION = 270
+cdef const int STRIP_OFFSETS = 273
+cdef const int SAMPLES_PER_PIXEL = 277
+cdef const int ROWS_PER_STRIP = 278
+cdef const int STRIP_BYTE_COUNTS = 279
+cdef const int X_RESOLUTION = 282
+cdef const int Y_RESOLUTION = 283
+cdef const int RESOLUTION_UNIT = 296
+cdef const int MM_METADATA = 51123
 
-SUMMARY_MD_HEADER = 2355492
+cdef const int SUMMARY_MD_HEADER = 2355492
 
 
-_POSITION_AXIS = "position"
-_ROW_AXIS = "row"
-_COLUMN_AXIS = "column"
-_Z_AXIS = "z"
-_TIME_AXIS = "time"
-_CHANNEL_AXIS = "channel"
+cdef const char _POSITION_AXIS = "position"
+cdef const char _ROW_AXIS = "row"
+cdef const char _COLUMN_AXIS = "column"
+cdef const char _Z_AXIS = "z"
+cdef const char _TIME_AXIS = "time"
+cdef const char _CHANNEL_AXIS = "channel"
 
-class SingleNDTiffWriter:
+
+cdef class SingleNDTiffWriter:
+    # type declarations
+    cdef str filename
+    cdef dict index_map
+    cdef int next_ifd_offset_location
+    cdef int res_numerator
+    cdef int res_denominator
+    cdef int z_step_um
+    cdef cqueue.Queue* buffers
+    cdef bool first_ifd
+    cdef int pixel_compression
+    cdef FILE* cfile
 
     def __init__(self, directory, filename, summary_md, pixel_compression = 1):
         self.filename = os.path.join(directory, filename)
@@ -65,24 +88,26 @@ class SingleNDTiffWriter:
             self.pixel_compression = pixel_compression
         else:
             raise ValueError("Invalid pixel compression, only 1 (no compression) and 8 (zlib) are supported")
-
-        self.start_time = None
         
-        os.makedirs(directory, exist_ok=True)
+        os.makedirs(directory, exist_ok = True)
+        
+        
         # pre-allocate the file 
-        file_path = os.path.join(directory, filename)
-        with open(file_path, 'wb') as f:
-            f.seek(MAX_FILE_SIZE - 1)
-            f.write(b'\0')
-            f.flush()
-
-        # reopen the file in binary mode
-        self.file = open(file_path, 'rb+')
+        # file_path = os.path.join(directory, filename)
+        cdef char* filename_byte_stream = self.filename.encode('utf-8')
+        # "w+": Open for reading and writing. Creates an empty file or truncates an existing file. 
+        cfile = fopen(filename_byte_stream, 'w+')
+        # set the file size to MAX_FILE_SIZE
+        fseek(cfile, MAX_FILE_SIZE - 1, SEEK_SET)
+        # write a null byte at the end of the file
+        cdef int zero_byte = 0
+        fwrite(&zero_byte, 1, 1, cfile)
         # reset position to 0
-        self.file.seek(0)
+        fseek(cfile, 0, SEEK_SET)
 
+        # write the file header
         self._write_mm_header_and_summary_md(summary_md)
-        self.reader = SingleNDTiffReader(self.filename, summary_md=summary_md)
+        #self.reader = SingleNDTiffReader
 
     def has_space_to_write(self, pixels, metadata):
         rgb = pixels.ndim == 3 and pixels.shape[2] == 3
@@ -91,7 +116,9 @@ class SingleNDTiffWriter:
         extra_padding = 5000000  # 5 MB extra padding
         bytes_per_pixels = self._bytes_per_image_pixels(pixels, rgb)
 
-        size = md_length + IFD_size + bytes_per_pixels + extra_padding + self.file.tell()
+        file_size = ftell(self.cfile)
+
+        size = md_length + IFD_size + bytes_per_pixels + extra_padding + file_size
 
         if size >= MAX_FILE_SIZE:
             return False
@@ -119,11 +146,24 @@ class SingleNDTiffWriter:
         # 8 bytes for summaryMD header and summary md length
         struct.pack_into('<II', header_buffer, 20, SUMMARY_MD_HEADER, md_length)
 
-        for buffer in [header_buffer, summary_md_bytes]:
-            self.file.write(buffer)
+        self.buffers.push_back(header_buffer)
+        self.buffers.push_back(summary_md_bytes)
+
+        self._write_byte_buffer()
+
+        #for buffer in [header_buffer, summary_md_bytes]:
+        #    self.file.write(buffer)
 
     def _get_bytes_from_string(self, s):
         return s.encode('utf-8')
+
+    cdef void _write_byte_buffer(self) nogil:
+        """
+        Write the buffer to the file
+        """
+        while self.buffers:
+            buffer = self.buffers.pop_front()
+            fwrite(buffer, 1, len(buffer), self.cfile)
 
     def finished_writing(self):
         self._write_null_offset_after_last_image()
