@@ -2,5 +2,5 @@ from setuptools import setup
 from Cython.Build import cythonize
 
 setup(
-    ext_modules=cythonize("ndstorage/ndtiff_file.pyx", language_level="3"),
+    ext_modules=cythonize("ndstorage/simple_file.pyx", language_level="3"),
 )
