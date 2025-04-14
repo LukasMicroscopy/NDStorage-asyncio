@@ -6,7 +6,6 @@ from libc.stdlib cimport malloc, free
 from cpython.bytes cimport PyBytes_AsStringAndSize
 from cpython.unicode cimport PyUnicode_AsUTF8
 
-cimport cython
 cimport numpy as cnp
 
 import json
@@ -16,14 +15,17 @@ cdef class SimpleFile:
 
     def __init__(self, str filename):
         cdef const char* c_filename
-        c_filename = filename.encode('utf-8')
+        byte_name = filename.encode('utf-8')
+        c_filename = byte_name
         # Open the file in write mode
+        print("Opening file")
         self.file = fopen(c_filename, "w+")
         if not self.file:
             raise IOError("Could not open file for writing")
 
     def __dealloc__(self):
         if self.file:
+            print("Closing file")
             fclose(self.file)
 
     def write_numpy_array(self, cnp.ndarray data):
@@ -36,7 +38,7 @@ cdef class SimpleFile:
 
     def write_bytearray(self, bytearray data):
         # make sure the bytearray doesen't change while we are writing
-        cdef const unsigned char* readonly_data = <const char*>data
+        cdef const unsigned char* readonly_data = <const unsigned char*>data
         # Get the size of the bytearray
         cdef size_t size = len(data)
         # Write the bytearray's data to the file
@@ -54,7 +56,7 @@ cdef class SimpleFile:
         # Write the bytes object's data to the file
         fwrite(<const void*>data, 1, size, self.file)
 
-    cdef size_t get_size(object obj):
+    cdef size_t get_size(self, object obj):
         """
         Get the size of the data in bytes for supported Python objects.
         """

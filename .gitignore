@@ -13,3 +13,5 @@ target/
 *.iml
 
 .vscode/*
+cython/simple_file.cpython-313-x86_64-linux-gnu.so
+cython/ndstorage/simple_file.c
