@@ -3,10 +3,11 @@
 # distutils: language=c++
 
 cimport cython
-from libcpp.deque cimport deque as cdeque
-from libc.stdio cimport fopen, fclose, fwrite, fread, fseek, ftell, FILE, SEEK_SET, SEEK_CUR, SEEK_END
+from cpython.collections cimport deque  # Import Cython deque
+from libc.stdio cimport fopen, fclose, fwrite, fread, fseek, ftell, fflush, FILE, SEEK_SET, SEEK_CUR, SEEK_END
 
 import numpy as np
+cimport numpy as cnp
 import sys
 import json
 import os
@@ -29,8 +30,8 @@ cdef const int MAJOR_VERSION = 3
 cdef const int MINOR_VERSION = 3
 
 # Constants for writing files
-cdef const int BYTES_PER_GIG = 1073741824
-cdef const int MAX_FILE_SIZE = 4 * BYTES_PER_GIG
+cdef const long int BYTES_PER_GIG = 1073741824
+cdef const long int MAX_FILE_SIZE = 4 * BYTES_PER_GIG
 
 cdef const int ENTRIES_PER_IFD = 13
 
@@ -69,7 +70,7 @@ cdef class SingleNDTiffWriter:
     cdef int res_numerator
     cdef int res_denominator
     cdef int z_step_um
-    cdef cqueue.Queue* buffers
+    cdef deque buffers
     cdef bool first_ifd
     cdef int pixel_compression
     cdef FILE* cfile
@@ -94,40 +95,42 @@ cdef class SingleNDTiffWriter:
         
         # pre-allocate the file 
         # file_path = os.path.join(directory, filename)
-        cdef char* filename_byte_stream = self.filename.encode('utf-8')
+        cdef char* filename_byte_stream 
+        encode_filename = self.filename.encode('utf-8')
+        filename_byte_stream = <char*>encode_filename
         # "w+": Open for reading and writing. Creates an empty file or truncates an existing file. 
-        cfile = fopen(filename_byte_stream, 'w+')
+        self.cfile = fopen(filename_byte_stream, 'w+')
         # set the file size to MAX_FILE_SIZE
-        fseek(cfile, MAX_FILE_SIZE - 1, SEEK_SET)
+        #fseek(self.cfile, MAX_FILE_SIZE - 1, SEEK_SET)
         # write a null byte at the end of the file
-        cdef int zero_byte = 0
-        fwrite(&zero_byte, 1, 1, cfile)
+        #cdef const int zero_byte = 0
+        #fwrite(&zero_byte, 1, 1, self.cfile)
         # reset position to 0
-        fseek(cfile, 0, SEEK_SET)
+        fseek(self.cfile, 0, SEEK_SET)
 
         # write the file header
         self._write_mm_header_and_summary_md(summary_md)
         #self.reader = SingleNDTiffReader
 
-    def has_space_to_write(self, pixels, metadata):
-        rgb = pixels.ndim == 3 and pixels.shape[2] == 3
-        md_length = len(metadata)
-        IFD_size = ENTRIES_PER_IFD * 12 + 4 + 16
-        extra_padding = 5000000  # 5 MB extra padding
-        bytes_per_pixels = self._bytes_per_image_pixels(pixels, rgb)
+    def has_space_to_write(self, cnp.ndarray pixels, dict metadata):
+        cdef bool rgb = pixels.ndim == 3 and pixels.shape[2] == 3
+        cdef dict md_length = len(metadata)
+        cdef const int IFD_size = ENTRIES_PER_IFD * 12 + 4 + 16
+        cdef const int extra_padding = 5000000  # 5 MB extra padding
+        cdef int bytes_per_pixels = self._bytes_per_image_pixels(pixels, rgb)
 
-        file_size = ftell(self.cfile)
+        cdef long int file_size = ftell(self.cfile)
 
-        size = md_length + IFD_size + bytes_per_pixels + extra_padding + file_size
+        cdef long int size = md_length + IFD_size + bytes_per_pixels + extra_padding + file_size
 
         if size >= MAX_FILE_SIZE:
             return False
         return True
 
-    def _write_mm_header_and_summary_md(self, summary_md):
-        summary_md_bytes = self._get_bytes_from_string(json.dumps(summary_md))
-        md_length = len(summary_md_bytes)
-        header_buffer = bytearray(28)
+    cdef _write_mm_header_and_summary_md(self, dict summary_md):
+        cdef bytes summary_md_bytes = self._get_bytes_from_string(json.dumps(summary_md))
+        cdef size_t md_length = len(summary_md_bytes)
+        cdef bytearray header_buffer = bytearray(28)
 
         # 8 bytes for file header
         if sys.byteorder == 'big':
@@ -135,7 +138,7 @@ cdef class SingleNDTiffWriter:
         else:
             struct.pack_into('<H', header_buffer, 0, 0x4949)
         struct.pack_into('<H', header_buffer, 2, 42)
-        first_ifd_offset = 28 + md_length
+        cdef size_t first_ifd_offset = 28 + md_length
         if first_ifd_offset % 2 == 1:
             first_ifd_offset += 1  # Start first IFD on a word
         struct.pack_into('<I', header_buffer, 4, first_ifd_offset)
@@ -146,10 +149,10 @@ cdef class SingleNDTiffWriter:
         # 8 bytes for summaryMD header and summary md length
         struct.pack_into('<II', header_buffer, 20, SUMMARY_MD_HEADER, md_length)
 
-        self.buffers.push_back(header_buffer)
-        self.buffers.push_back(summary_md_bytes)
+        self.buffers.append(header_buffer)
+        self.buffers.append(summary_md_bytes)
 
-        self._write_byte_buffer()
+        self._write_buffer()
 
         #for buffer in [header_buffer, summary_md_bytes]:
         #    self.file.write(buffer)
@@ -157,29 +160,64 @@ cdef class SingleNDTiffWriter:
     def _get_bytes_from_string(self, s):
         return s.encode('utf-8')
 
-    cdef void _write_byte_buffer(self) nogil:
+    cdef void _write_buffer(self) nogil:
         """
         Write the buffer to the file
         """
         while self.buffers:
-            buffer = self.buffers.pop_front()
-            fwrite(buffer, 1, len(buffer), self.cfile)
+            buffer = self.buffers.popleft()
+            self._write_object(buffer)
+        self.cfile.fflush()
+
+    cdef void _write_object(self, object obj) nogil:
+        """
+        Write the object to the file
+        """
+        if isinstance(obj, (bytes, bytearray)):
+            # make sure the bytearray doesen't change while we are writing
+            cdef const unsigned char* data = <const unsigned char*>obj
+            # Get the size of the bytearray
+            cdef size_t size = len(obj)
+            fwrite(<const void*>data, 1, size, self.file)
+        elif isinstance(obj, cnp.ndarray):
+            # Make sure the arraz is not altered while we are writing
+            cdef const unsigned char* data = <const unsigned char*>obj.data
+            # Get the size of the array in bytes
+            cdef size_t size = obj.size * obj.itemsize
+            fwrite(<const void*>data, 1, size, self.file)
+        elif isinstance(obj, dict):
+            # Serialize the dictionary to a JSON string and encode it as UTF-8
+            cdef bytes json_bytes = json.dumps(data).encode('utf-8')
+            cdef const unsigned char* data = json_bytes
+            cdef size_t json_size = len(json_bytes)
+            fwrite(<const void*>data, 1, size, self.file)
+        elif isinstance(obj, str):
+            # Convert the string to bytes and write it to the file
+            cdef bytes data = obj.encode('utf-8')
+            cdef const unsigned char* data = <const unsigned char*>data.data
+            # Get the size of the array in bytes
+            cdef size_t size = obj.size * obj.itemsize
+            fwrite(<const void*>data, 1, size, self.file)
+        else:
+            raise TypeError("Unsupported data type")
 
     def finished_writing(self):
         self._write_null_offset_after_last_image()
-        self.file.truncate()
-        self.file.flush()
-        self.file.close()
+        #self.cfile.ftruncate()
+        fflush(self.cfile)
+        # close the file
+        fclose(self.cfile)
+        self.cfile = NULL
 
-    def _write_null_offset_after_last_image(self):
-        buffer = bytearray(4)
+    cdef void _write_null_offset_after_last_image(self):
+        cdef bytearray buffer = bytearray(4)
         struct.pack_into('<I', buffer, 0, 0)
-        current_pos = self.file.tell()
-        self.file.seek(self.next_ifd_offset_location)
-        self.file.write(buffer)
-        self.file.seek(current_pos)
+        cdef long int current_pos = ftell(self.cfile)
+        fseek(self.cfile, self.next_ifd_offset_location, SEEK_SET)
+        fwrite(self.cfile, <const void*>buffer, 1, 4)
+        fseek(self.cfile, current_pos, SEEK_SET)
 
-    def write_image(self, index_key, pixels, metadata, bit_depth='auto', pixel_compression = 0):
+    def write_image(self, dict index_key, cnp.ndarray pixels, dict metadata, bit_depth='auto', int pixel_compression = 0):
         """
         Write an image to the file
 
@@ -218,20 +256,24 @@ cdef class SingleNDTiffWriter:
         if isinstance(metadata, dict):
             metadata = self._get_bytes_from_string(json.dumps(metadata))
         ied = self._write_ifd(index_key, pixels, metadata, rgb, image_height, image_width, bit_depth, pixel_compression)
-        while self.buffers:
-            self.file.write(self.buffers.popleft())
+        #while self.buffers:
+        #    self.file.write(self.buffers.popleft())
         # make sure the file is flushed to disk
-        self.file.flush()
+        #self.file.flush()
+        self._write_buffer()
         self.index_map[index_key] = ied
         return ied
 
 
-    def _write_ifd(self, index_key, pixels, metadata, rgb, image_height, image_width, bit_depth, pixel_compression):
-        if self.file.tell() % 2 == 1:
-            self.file.seek(self.file.tell() + 1)  # Make IFD start on word
+    def _write_ifd(self, dict index_key, cnp.ndarray pixels, bytes metadata, bool rgb, int image_height, int image_width, int bit_depth, int pixel_compression):
+        if ftell(self.cfile) % 2 == 1:
+            cdef const int zero_byte = 0
+            fwrite(self.cfile, &zero_byte, 1, 1)  # Make IFD start on word
+            #self.file.seek(self.file.tell() + 1)  # Make IFD start on word
 
+        cdef int byte_depth = 0
         if isinstance(pixels, bytearray):
-            byte_depth = 1
+            int byte_depth = 1
         # if the pixel object is a numpy array, it is type of <class 'numpy.ndarray'>
         # when using np_array.tobytes it is <class 'bytes'>
         # therefore taking the the bit_depth information "pixels.dtype" into account
@@ -345,15 +387,15 @@ cdef class SingleNDTiffWriter:
         else:
             return pixels
 
-    def _bytes_per_image_pixels(self, pixels, rgb):
+    cdef int _bytes_per_image_pixels(self, cnp.ndarray pixels, bool rgb):
         if rgb:
             return len(pixels) * 3 // 4
         else:
             if isinstance(pixels, bytearray):
                 return len(pixels)
-            elif isinstance(pixels, np.ndarray) and pixels.dtype == np.uint16:
+            elif isinstance(pixels, cnp.ndarray) and pixels.dtype == np.uint16:
                 return pixels.size * 2
-            elif isinstance(pixels, np.ndarray) and pixels.dtype == np.uint8:
+            elif isinstance(pixels, cnp.ndarray) and pixels.dtype == np.uint8:
                 return pixels.size
             else:
                 raise RuntimeError("unknown pixel type")
