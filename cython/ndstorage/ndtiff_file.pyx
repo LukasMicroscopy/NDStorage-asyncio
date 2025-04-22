@@ -5,6 +5,7 @@
 cimport cython
 from cpython.collections cimport deque  # Import Cython deque
 from libc.stdio cimport fopen, fclose, fwrite, fread, fseek, ftell, fflush, FILE, SEEK_SET, SEEK_CUR, SEEK_END
+from libcpp cimport bool as bool_t
 
 import numpy as np
 cimport numpy as cnp
@@ -16,6 +17,7 @@ import struct
 import warnings
 import mmap
 import zlib
+from threading import Lock
 
 from collections import OrderedDict
 from io import BytesIO
@@ -26,40 +28,40 @@ from collections import deque
 
 from concurrent.futures import ThreadPoolExecutor
 
-cdef const int MAJOR_VERSION = 3
-cdef const int MINOR_VERSION = 3
+cdef int MAJOR_VERSION = 3
+cdef int MINOR_VERSION = 3
 
 # Constants for writing files
-cdef const long int BYTES_PER_GIG = 1073741824
-cdef const long int MAX_FILE_SIZE = 4 * BYTES_PER_GIG
+cdef long int BYTES_PER_GIG = 1073741824
+cdef long int MAX_FILE_SIZE = 4 * BYTES_PER_GIG
 
-cdef const int ENTRIES_PER_IFD = 13
+cdef int ENTRIES_PER_IFD = 13
 
 # Required tags
-cdef const int WIDTH = 256
-cdef const int HEIGHT = 257
-cdef const int BITS_PER_SAMPLE = 258
-cdef const int COMPRESSION = 259
-cdef const int PHOTOMETRIC_INTERPRETATION = 262
-cdef const int IMAGE_DESCRIPTION = 270
-cdef const int STRIP_OFFSETS = 273
-cdef const int SAMPLES_PER_PIXEL = 277
-cdef const int ROWS_PER_STRIP = 278
-cdef const int STRIP_BYTE_COUNTS = 279
-cdef const int X_RESOLUTION = 282
-cdef const int Y_RESOLUTION = 283
-cdef const int RESOLUTION_UNIT = 296
-cdef const int MM_METADATA = 51123
+cdef int WIDTH = 256
+cdef int HEIGHT = 257
+cdef int BITS_PER_SAMPLE = 258
+cdef int COMPRESSION = 259
+cdef int PHOTOMETRIC_INTERPRETATION = 262
+cdef int IMAGE_DESCRIPTION = 270
+cdef int STRIP_OFFSETS = 273
+cdef int SAMPLES_PER_PIXEL = 277
+cdef int ROWS_PER_STRIP = 278
+cdef int STRIP_BYTE_COUNTS = 279
+cdef int X_RESOLUTION = 282
+cdef int Y_RESOLUTION = 283
+cdef int RESOLUTION_UNIT = 296
+cdef int MM_METADATA = 51123
 
-cdef const int SUMMARY_MD_HEADER = 2355492
+cdef int SUMMARY_MD_HEADER = 2355492
 
 
-cdef const char _POSITION_AXIS = "position"
-cdef const char _ROW_AXIS = "row"
-cdef const char _COLUMN_AXIS = "column"
-cdef const char _Z_AXIS = "z"
-cdef const char _TIME_AXIS = "time"
-cdef const char _CHANNEL_AXIS = "channel"
+cdef const char* _POSITION_AXIS = "position"
+cdef const char* _ROW_AXIS = "row"
+cdef const char* _COLUMN_AXIS = "column"
+cdef const char* _Z_AXIS = "z"
+cdef const char* _TIME_AXIS = "time"
+cdef const char* _CHANNEL_AXIS = "channel"
 
 
 cdef class SingleNDTiffWriter:
@@ -70,8 +72,8 @@ cdef class SingleNDTiffWriter:
     cdef int res_numerator
     cdef int res_denominator
     cdef int z_step_um
-    cdef deque buffers
-    cdef bool first_ifd
+    #cdef deque buffers
+    cdef bool_t first_ifd
     cdef int pixel_compression
     cdef FILE* cfile
 
@@ -84,6 +86,8 @@ cdef class SingleNDTiffWriter:
         self.z_step_um = 1
         self.buffers = deque()
         self.first_ifd = True
+
+        self.write_lock = Lock()
 
         if pixel_compression in [1, 8]:
             self.pixel_compression = pixel_compression
@@ -113,10 +117,10 @@ cdef class SingleNDTiffWriter:
         #self.reader = SingleNDTiffReader
 
     def has_space_to_write(self, cnp.ndarray pixels, dict metadata):
-        cdef bool rgb = pixels.ndim == 3 and pixels.shape[2] == 3
+        cdef bool_t rgb = pixels.ndim == 3 and pixels.shape[2] == 3
         cdef dict md_length = len(metadata)
-        cdef const int IFD_size = ENTRIES_PER_IFD * 12 + 4 + 16
-        cdef const int extra_padding = 5000000  # 5 MB extra padding
+        cdef int IFD_size = ENTRIES_PER_IFD * 12 + 4 + 16
+        cdef int extra_padding = 5000000  # 5 MB extra padding
         cdef int bytes_per_pixels = self._bytes_per_image_pixels(pixels, rgb)
 
         cdef long int file_size = ftell(self.cfile)
@@ -150,7 +154,9 @@ cdef class SingleNDTiffWriter:
         struct.pack_into('<II', header_buffer, 20, SUMMARY_MD_HEADER, md_length)
 
         self.buffers.append(header_buffer)
+        #self._append_buffer(header_buffer)
         self.buffers.append(summary_md_bytes)
+        #self._append_buffer(summary_md_bytes)
 
         self._write_buffer()
 
@@ -160,44 +166,92 @@ cdef class SingleNDTiffWriter:
     def _get_bytes_from_string(self, s):
         return s.encode('utf-8')
 
-    cdef void _write_buffer(self) nogil:
+    cdef void _write_buffer(self):
         """
         Write the buffer to the file
         """
         while self.buffers:
-            buffer = self.buffers.popleft()
-            self._write_object(buffer)
-        self.cfile.fflush()
+            #buffer = self.buffers.popleft()
+            buffer, size = self.buffers.popleft()
+            #self._write_object(buffer)
+            fwrite(<const void*>buffer, 1, size, self.cfile)
+        with cython.nogil:
+            fflush(self.cfile)
 
-    cdef void _write_object(self, object obj) nogil:
+    cdef void _append_buffer(self, object obj):
         """
         Write the object to the file
         """
+        cdef const unsigned char* data
+        cdef bytes json_bytes
+        cdef size_t size
+        cdef bytes data_bytes
         if isinstance(obj, (bytes, bytearray)):
             # make sure the bytearray doesen't change while we are writing
-            cdef const unsigned char* data = <const unsigned char*>obj
+            data = <const unsigned char*>obj
             # Get the size of the bytearray
-            cdef size_t size = len(obj)
-            fwrite(<const void*>data, 1, size, self.file)
+            size = len(obj)
+            #fwrite(<const void*>data, 1, size, self.file)
+            self.buffers.append((data, size))
         elif isinstance(obj, cnp.ndarray):
             # Make sure the arraz is not altered while we are writing
-            cdef const unsigned char* data = <const unsigned char*>obj.data
+            data = <const unsigned char*>obj.data
             # Get the size of the array in bytes
-            cdef size_t size = obj.size * obj.itemsize
-            fwrite(<const void*>data, 1, size, self.file)
+            size = obj.size * obj.itemsize
+            #fwrite(<const void*>data, 1, size, self.file)
+            self.buffers.append((data, size))
         elif isinstance(obj, dict):
             # Serialize the dictionary to a JSON string and encode it as UTF-8
-            cdef bytes json_bytes = json.dumps(data).encode('utf-8')
-            cdef const unsigned char* data = json_bytes
-            cdef size_t json_size = len(json_bytes)
-            fwrite(<const void*>data, 1, size, self.file)
+            json_bytes = json.dumps(obj).encode('utf-8')
+            data = json_bytes
+            size = len(json_bytes)
+            #fwrite(<const void*>data, 1, size, self.file)
+            self.buffers.append((data, size))
         elif isinstance(obj, str):
             # Convert the string to bytes and write it to the file
-            cdef bytes data = obj.encode('utf-8')
-            cdef const unsigned char* data = <const unsigned char*>data.data
+            data_bytes = obj.encode('utf-8')
+            data = <const unsigned char*>data_bytes.data
             # Get the size of the array in bytes
-            cdef size_t size = obj.size * obj.itemsize
-            fwrite(<const void*>data, 1, size, self.file)
+            size = len(data_bytes)
+            #fwrite(<const void*>data, 1, size, self.cfile)
+            self.buffers.append((data, size))
+        else:
+            raise TypeError("Unsupported data type")
+
+
+    cdef void _write_object(self, object obj):
+        """
+        Write the object to the file
+        """
+        cdef const unsigned char* data
+        cdef bytes json_bytes
+        cdef size_t size
+        cdef bytes data_bytes
+        if isinstance(obj, (bytes, bytearray)):
+            # make sure the bytearray doesen't change while we are writing
+            data = <const unsigned char*>obj
+            # Get the size of the bytearray
+            size = len(obj)
+            fwrite(<const void*>data, 1, size, self.cfile)
+        elif isinstance(obj, cnp.ndarray):
+            # Make sure the arraz is not altered while we are writing
+            data = <const unsigned char*>obj.data
+            # Get the size of the array in bytes
+            size = obj.size * obj.itemsize
+            fwrite(<const void*>data, 1, size, self.cfile)
+        elif isinstance(obj, dict):
+            # Serialize the dictionary to a JSON string and encode it as UTF-8
+            json_bytes = json.dumps(obj).encode('utf-8')
+            data = json_bytes
+            size = len(json_bytes)
+            fwrite(<const void*>data, 1, size, self.cfile)
+        elif isinstance(obj, str):
+            # Convert the string to bytes and write it to the file
+            data_bytes = obj.encode('utf-8')
+            data = <const unsigned char*>data_bytes.data
+            # Get the size of the array in bytes
+            size = len(data_bytes)
+            fwrite(<const void*>data, 1, size, self.cfile)
         else:
             raise TypeError("Unsupported data type")
 
@@ -214,7 +268,7 @@ cdef class SingleNDTiffWriter:
         struct.pack_into('<I', buffer, 0, 0)
         cdef long int current_pos = ftell(self.cfile)
         fseek(self.cfile, self.next_ifd_offset_location, SEEK_SET)
-        fwrite(self.cfile, <const void*>buffer, 1, 4)
+        fwrite(<const void*>buffer, 1, 4,self.cfile)
         fseek(self.cfile, current_pos, SEEK_SET)
 
     def write_image(self, dict index_key, cnp.ndarray pixels, dict metadata, bit_depth='auto', int pixel_compression = 0):
@@ -240,7 +294,8 @@ cdef class SingleNDTiffWriter:
         if pixel_compression == 0:
             pixel_compression = self.pixel_compression
         
-        image_height, image_width = pixels.shape
+        cdef Py_ssize_t image_height, image_width  # Declare variables for the shape
+        image_height, image_width = pixels.shape[0], pixels.shape[1]
         rgb = pixels.ndim == 3 and pixels.shape[2] == 3
         
         if rgb and pixel_compression in [8]:
@@ -260,23 +315,22 @@ cdef class SingleNDTiffWriter:
         #    self.file.write(self.buffers.popleft())
         # make sure the file is flushed to disk
         #self.file.flush()
-        self._write_buffer()
+        with self.write_lock:
+            self._write_buffer()
         self.index_map[index_key] = ied
         return ied
 
 
-    def _write_ifd(self, dict index_key, cnp.ndarray pixels, bytes metadata, bool rgb, int image_height, int image_width, int bit_depth, int pixel_compression):
+    cdef _write_ifd(self, dict index_key, cnp.ndarray pixels, bytes metadata, bool_t rgb, int image_height, int image_width, int bit_depth, int pixel_compression):
         if ftell(self.cfile) % 2 == 1:
-            cdef const int zero_byte = 0
-            fwrite(self.cfile, &zero_byte, 1, 1)  # Make IFD start on word
+            fseek(self.cfile, 1, SEEK_CUR)  # Make IFD start on word
+            #cdef const int zero_byte = 0
+            #fwrite(self.cfile, &zero_byte, 1, 1)  # Make IFD start on word
             #self.file.seek(self.file.tell() + 1)  # Make IFD start on word
 
         cdef int byte_depth = 0
         if isinstance(pixels, bytearray):
-            int byte_depth = 1
-        # if the pixel object is a numpy array, it is type of <class 'numpy.ndarray'>
-        # when using np_array.tobytes it is <class 'bytes'>
-        # therefore taking the the bit_depth information "pixels.dtype" into account
+            byte_depth = 1
         elif bit_depth == 8:
             byte_depth = 1
         else:
@@ -288,27 +342,29 @@ cdef class SingleNDTiffWriter:
         else:
             bytes_per_image_pixels = self._bytes_per_image_pixels(pixels, rgb)
         
-        num_entries = 13
+        cdef int num_entries = 13
 
         # 2 bytes for number of directory entries, 12 bytes per directory entry, 4 byte offset of next IFD
         # 6 bytes for bits per sample if RGB, 16 bytes for x and y resolution, 1 byte per character of MD string
         # number of bytes for pixels
+
+        cdef int ifd_and_bit_depth_bytes
         ifd_and_bit_depth_bytes = 2 + num_entries * 12 + 4 + (6 if rgb else 0) + 16
-        ifd_and_small_vals_buffer = bytearray(ifd_and_bit_depth_bytes)
+        cdef bytearray ifd_and_small_vals_buffer = bytearray(ifd_and_bit_depth_bytes)
 
         # Needed to reset to zero after last IFD
         self.next_ifd_offset_location = self.file.tell() + 2 + num_entries * 12
-        bits_per_sample_offset = self.next_ifd_offset_location + 4
-        x_resolution_offset = bits_per_sample_offset + (6 if rgb else 0)
-        y_resolution_offset = x_resolution_offset + 8
-        pixel_data_offset = y_resolution_offset + 8
-        metadata_offset = pixel_data_offset + bytes_per_image_pixels
+        cdef int bits_per_sample_offset = self.next_ifd_offset_location + 4
+        cdef int x_resolution_offset = bits_per_sample_offset + (6 if rgb else 0)
+        cdef int y_resolution_offset = x_resolution_offset + 8
+        cdef int pixel_data_offset = y_resolution_offset + 8
+        cdef int metadata_offset = pixel_data_offset + bytes_per_image_pixels
 
-        next_ifd_offset = metadata_offset + len(metadata)
+        cdef int next_ifd_offset = metadata_offset + len(metadata)
         if next_ifd_offset % 2 == 1:
             next_ifd_offset += 1  # Make IFD start on word
 
-        buffer_position = 0
+        cdef int buffer_position = 0
         struct.pack_into('<H', ifd_and_small_vals_buffer, buffer_position, num_entries)
         buffer_position += 2
 
@@ -349,11 +405,16 @@ cdef class SingleNDTiffWriter:
         buffer_position += 8
 
         self.buffers.append(ifd_and_small_vals_buffer)
+        #self._append_buffer(ifd_and_small_vals_buffer)
         if pixel_compression in [8]:
             self.buffers.append(compressed_pixels)
+            #self._append_buffer(compressed_pixels)
         else:
             self.buffers.append(self._get_pixel_buffer(pixels, rgb))
+            #self._append_buffer(self._get_pixel_buffer(pixels, rgb))
+
         self.buffers.append(metadata)
+        #self._append_buffer(metadata)
 
         self.first_ifd = False
 
@@ -370,7 +431,7 @@ cdef class SingleNDTiffWriter:
         return NDTiffIndexEntry(index_key, pixel_type, pixel_data_offset, image_width, image_height, metadata_offset,
                                 len(metadata), self.filename.split(os.sep)[-1], pixel_compression)
 
-    def _write_ifd_entry(self, buffer, tag, dtype, count, value, buffer_position):
+    cdef int _write_ifd_entry(self, bytearray buffer, int tag, int dtype, int count, int value, int buffer_position):
         struct.pack_into('<HHII', buffer, buffer_position, tag, dtype, count, value)
         return 12
 
@@ -387,7 +448,7 @@ cdef class SingleNDTiffWriter:
         else:
             return pixels
 
-    cdef int _bytes_per_image_pixels(self, cnp.ndarray pixels, bool rgb):
+    cdef int _bytes_per_image_pixels(self, cnp.ndarray pixels, bool_t rgb):
         if rgb:
             return len(pixels) * 3 // 4
         else:
