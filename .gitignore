@@ -15,3 +15,7 @@ target/
 .vscode/*
 cython/simple_file.cpython-313-x86_64-linux-gnu.so
 cython/ndstorage/simple_file.c
+cython/ndstorage/ndtiff_cfile.cpp
+cython/ndstorage/ndtiff_file.cpp
+cython/ndtiff_file.cpython-313-x86_64-linux-gnu.so
+cython/ndtiff_cfile.cpython-313-x86_64-linux-gnu.so

@@ -3,7 +3,7 @@
 # distutils: language=c++
 
 cimport cython
-from cpython.collections cimport deque  # Import Cython deque
+#from cpython.collections cimport deque  # Import Cython deque
 from libc.stdio cimport fopen, fclose, fwrite, fread, fseek, ftell, fflush, FILE, SEEK_SET, SEEK_CUR, SEEK_END
 from libcpp cimport bool as bool_t
 
@@ -12,21 +12,21 @@ cimport numpy as cnp
 import sys
 import json
 import os
-import time
+#import time
 import struct
 import warnings
 import mmap
 import zlib
 from threading import Lock
 
-from collections import OrderedDict
-from io import BytesIO
+#from collections import OrderedDict
+#from io import BytesIO
 from .file_io import NDTiffFileIO, BUILTIN_FILE_IO
 from .ndtiff_index import NDTiffIndexEntry
 
 from collections import deque
 
-from concurrent.futures import ThreadPoolExecutor
+#from concurrent.futures import ThreadPoolExecutor
 
 cdef int MAJOR_VERSION = 3
 cdef int MINOR_VERSION = 3
@@ -72,7 +72,9 @@ cdef class SingleNDTiffWriter:
     cdef int res_numerator
     cdef int res_denominator
     cdef int z_step_um
-    #cdef deque buffers
+    cdef object buffers # deque
+    cdef object write_lock # Lock
+    cdef object reader # SingleNDTiffReader
     cdef bool_t first_ifd
     cdef int pixel_compression
     cdef FILE* cfile
@@ -96,25 +98,20 @@ cdef class SingleNDTiffWriter:
         
         os.makedirs(directory, exist_ok = True)
         
-        
-        # pre-allocate the file 
-        # file_path = os.path.join(directory, filename)
+        # Open the file for writing
+        # get file name as byte stream
         cdef char* filename_byte_stream 
         encode_filename = self.filename.encode('utf-8')
         filename_byte_stream = <char*>encode_filename
-        # "w+": Open for reading and writing. Creates an empty file or truncates an existing file. 
+        
+        # "w+": Open for reading and writing.
         self.cfile = fopen(filename_byte_stream, 'w+')
-        # set the file size to MAX_FILE_SIZE
-        #fseek(self.cfile, MAX_FILE_SIZE - 1, SEEK_SET)
-        # write a null byte at the end of the file
-        #cdef const int zero_byte = 0
-        #fwrite(&zero_byte, 1, 1, self.cfile)
-        # reset position to 0
+        # make sure to start writing at the beginning of the file
         fseek(self.cfile, 0, SEEK_SET)
 
         # write the file header
         self._write_mm_header_and_summary_md(summary_md)
-        #self.reader = SingleNDTiffReader
+        self.reader = SingleNDTiffReader
 
     def has_space_to_write(self, cnp.ndarray pixels, dict metadata):
         cdef bool_t rgb = pixels.ndim == 3 and pixels.shape[2] == 3
@@ -171,10 +168,10 @@ cdef class SingleNDTiffWriter:
         Write the buffer to the file
         """
         while self.buffers:
-            #buffer = self.buffers.popleft()
-            buffer, size = self.buffers.popleft()
-            #self._write_object(buffer)
-            fwrite(<const void*>buffer, 1, size, self.cfile)
+            buffer = self.buffers.popleft()
+            #buffer, size = self.buffers.popleft()
+            self._write_object(buffer)
+            #fwrite(<const void*>buffer, 1, size, self.cfile)
         with cython.nogil:
             fflush(self.cfile)
 
@@ -235,7 +232,8 @@ cdef class SingleNDTiffWriter:
             fwrite(<const void*>data, 1, size, self.cfile)
         elif isinstance(obj, cnp.ndarray):
             # Make sure the arraz is not altered while we are writing
-            data = <const unsigned char*>obj.data
+            data_bytes = obj.tobytes()
+            data = <const unsigned char*>data_bytes
             # Get the size of the array in bytes
             size = obj.size * obj.itemsize
             fwrite(<const void*>data, 1, size, self.cfile)
@@ -271,7 +269,7 @@ cdef class SingleNDTiffWriter:
         fwrite(<const void*>buffer, 1, 4,self.cfile)
         fseek(self.cfile, current_pos, SEEK_SET)
 
-    def write_image(self, dict index_key, cnp.ndarray pixels, dict metadata, bit_depth='auto', int pixel_compression = 0):
+    def write_image(self, frozenset index_key, cnp.ndarray pixels, dict metadata, bit_depth='auto', int pixel_compression = 0):
         """
         Write an image to the file
 
@@ -309,8 +307,8 @@ cdef class SingleNDTiffWriter:
             bit_depth = 8 if pixels.dtype == np.uint8 else 16
         # if metadata is a dict, serialize it to a json string and make it a utf8 byte buffer
         if isinstance(metadata, dict):
-            metadata = self._get_bytes_from_string(json.dumps(metadata))
-        ied = self._write_ifd(index_key, pixels, metadata, rgb, image_height, image_width, bit_depth, pixel_compression)
+            metadata_bytes = self._get_bytes_from_string(json.dumps(metadata))
+        ied = self._write_ifd(index_key, pixels, metadata_bytes, rgb, image_height, image_width, bit_depth, pixel_compression)
         #while self.buffers:
         #    self.file.write(self.buffers.popleft())
         # make sure the file is flushed to disk
@@ -321,7 +319,7 @@ cdef class SingleNDTiffWriter:
         return ied
 
 
-    cdef _write_ifd(self, dict index_key, cnp.ndarray pixels, bytes metadata, bool_t rgb, int image_height, int image_width, int bit_depth, int pixel_compression):
+    cdef _write_ifd(self, frozenset index_key, cnp.ndarray pixels, bytes metadata, bool_t rgb, int image_height, int image_width, int bit_depth, int pixel_compression):
         if ftell(self.cfile) % 2 == 1:
             fseek(self.cfile, 1, SEEK_CUR)  # Make IFD start on word
             #cdef const int zero_byte = 0
@@ -353,7 +351,7 @@ cdef class SingleNDTiffWriter:
         cdef bytearray ifd_and_small_vals_buffer = bytearray(ifd_and_bit_depth_bytes)
 
         # Needed to reset to zero after last IFD
-        self.next_ifd_offset_location = self.file.tell() + 2 + num_entries * 12
+        self.next_ifd_offset_location = ftell(self.cfile) + 2 + num_entries * 12
         cdef int bits_per_sample_offset = self.next_ifd_offset_location + 4
         cdef int x_resolution_offset = bits_per_sample_offset + (6 if rgb else 0)
         cdef int y_resolution_offset = x_resolution_offset + 8
