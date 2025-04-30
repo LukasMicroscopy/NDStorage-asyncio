@@ -1,7 +1,9 @@
 import numpy as np
 import os
 import shutil
-from ndtiff_cfile import SingleNDTiffWriter, SingleNDTiffReader
+from ndstorage.ndtiff_file import SingleNDTiffReader
+from ndstorage import NDTiffDataset
+from ndcfile import SingleNDTiffWriter
 #from ..ndtiff_dataset import NDTiffDataset
 #from ..ndram_dataset import NDRAMDataset
 import pytest
@@ -20,6 +22,7 @@ def test_write_single_file(test_data_path):
     """
     filename = 'test_write_single_file.tif'
     writer = SingleNDTiffWriter(test_data_path, filename, summary_md={})
+    print(f"initalizing writer: {writer.filename}")
 
     image_height = 256
     image_width = 256

@@ -1,0 +1,24 @@
+[project]
+name = "ndcfile"
+version = "0.1.0"
+requires-python = ">=3.12"
+
+[tool.uv]
+environments = [
+    "sys_platform == 'darwin'",
+    "sys_platform == 'linux'",
+]
+
+[project.optional-dependencies]
+build = ["setuptools", "wheel", "Cython", "numpy"]
+
+[build-system]
+requires = ["setuptools", "wheel", "Cython", "numpy"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["ndcfile"]
+
+[tool.setuptools.package-data]
+"ndstorage" = ["*.pyx", "*.pxd"]
+

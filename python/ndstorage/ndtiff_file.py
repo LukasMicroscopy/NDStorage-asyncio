@@ -357,8 +357,8 @@ class SingleNDTiffReader:
             self.summary_md, self.first_ifd_offset = self._read_header()
         else:
             self.summary_md = summary_md
-            self.major_version = MAJOR_VERSION
-            self.minor_version = MINOR_VERSION
+        self.major_version = MAJOR_VERSION
+        self.minor_version = MINOR_VERSION
 
     def close(self):
         """ """

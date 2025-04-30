@@ -23,13 +23,14 @@ from threading import Lock
 #from io import BytesIO
 from ndstorage.file_io import NDTiffFileIO, BUILTIN_FILE_IO
 from ndstorage.ndtiff_index import NDTiffIndexEntry
+from ndstorage.ndtiff_file import SingleNDTiffReader
 
 from collections import deque
 
 #from concurrent.futures import ThreadPoolExecutor
 
-cdef int MAJOR_VERSION = 3
-cdef int MINOR_VERSION = 3
+#cdef int MAJOR_VERSION = 3
+#cdef int MINOR_VERSION = 3
 
 # Constants for writing files
 cdef long int BYTES_PER_GIG = 1073741824
@@ -66,21 +67,23 @@ cdef const char* _CHANNEL_AXIS = "channel"
 
 cdef class SingleNDTiffWriter:
     # type declarations
-    cdef str filename
+    #cdef str filename
     cdef dict index_map
     cdef int next_ifd_offset_location
     cdef int res_numerator
     cdef int res_denominator
     cdef int z_step_um
+    cdef readonly str filename
     cdef object buffers # deque
     cdef object write_lock # Lock
-    cdef object reader # SingleNDTiffReader
+    cdef readonly object reader # SingleNDTiffReader
     cdef bool_t first_ifd
     cdef int pixel_compression
     cdef FILE* cfile
 
     def __init__(self, directory, filename, summary_md, pixel_compression = 1):
         self.filename = os.path.join(directory, filename)
+        print(f"Initialize writer {self.filename}")
         self.index_map = {}
         self.next_ifd_offset_location = -1
         self.res_numerator = 1
@@ -115,7 +118,7 @@ cdef class SingleNDTiffWriter:
 
     def has_space_to_write(self, cnp.ndarray pixels, dict metadata):
         cdef bool_t rgb = pixels.ndim == 3 and pixels.shape[2] == 3
-        cdef dict md_length = len(metadata)
+        cdef int md_length = len(metadata)
         cdef int IFD_size = ENTRIES_PER_IFD * 12 + 4 + 16
         cdef int extra_padding = 5000000  # 5 MB extra padding
         cdef int bytes_per_pixels = self._bytes_per_image_pixels(pixels, rgb)
@@ -145,7 +148,7 @@ cdef class SingleNDTiffWriter:
         struct.pack_into('<I', header_buffer, 4, first_ifd_offset)
 
         # 12 bytes for unique identifier and major version
-        struct.pack_into('<III', header_buffer, 8, 483729, MAJOR_VERSION, MINOR_VERSION)
+        struct.pack_into('<III', header_buffer, 8, 483729, 3, 3)
 
         # 8 bytes for summaryMD header and summary md length
         struct.pack_into('<II', header_buffer, 20, SUMMARY_MD_HEADER, md_length)
@@ -356,7 +359,7 @@ cdef class SingleNDTiffWriter:
         cdef int x_resolution_offset = bits_per_sample_offset + (6 if rgb else 0)
         cdef int y_resolution_offset = x_resolution_offset + 8
         cdef int pixel_data_offset = y_resolution_offset + 8
-        cdef int metadata_offset = pixel_data_offset + bytes_per_image_pixels
+        cdef long metadata_offset = pixel_data_offset + bytes_per_image_pixels
 
         cdef int next_ifd_offset = metadata_offset + len(metadata)
         if next_ifd_offset % 2 == 1:
@@ -429,7 +432,7 @@ cdef class SingleNDTiffWriter:
         return NDTiffIndexEntry(index_key, pixel_type, pixel_data_offset, image_width, image_height, metadata_offset,
                                 len(metadata), self.filename.split(os.sep)[-1], pixel_compression)
 
-    cdef int _write_ifd_entry(self, bytearray buffer, int tag, int dtype, int count, int value, int buffer_position):
+    cdef int _write_ifd_entry(self, bytearray buffer, long tag, long dtype, long count, long value, long buffer_position):
         struct.pack_into('<HHII', buffer, buffer_position, tag, dtype, count, value)
         return 12
 
@@ -458,124 +461,3 @@ cdef class SingleNDTiffWriter:
                 return pixels.size
             else:
                 raise RuntimeError("unknown pixel type")
-
-
-class SingleNDTiffReader:
-    """
-    Class corresponsing to a single multipage tiff file
-    Pass the full path of the TIFF to instantiate and call close() when finished
-    """
-
-    # file format constants
-    SUMMARY_MD_HEADER = 2355492
-    EIGHT_BIT_MONOCHROME = 0
-    SIXTEEN_BIT_MONOCHROME = 1
-    EIGHT_BIT_RGB = 2
-    TEN_BIT_MONOCHROME = 3
-    TWELVE_BIT_MONOCHROME = 4
-    FOURTEEN_BIT_MONOCHROME = 5
-    ELEVEN_BIT_MONOCHROME = 6
-
-    ZLIB_COMPRESSED = 8
-    NO_COMPRESSION = 1
-    UNCOMPRESSED = 0
-
-    def __init__(self, tiff_path, file_io: NDTiffFileIO = BUILTIN_FILE_IO, summary_md=None):
-        """
-        tiff_path: str
-            The path to a .tiff file to load
-        file_io: ndtiff.file_io.NDTiffFileIO
-            A container containing various methods for interacting with files.
-        summary_md: dict
-            If not None, this corresponds to a file that is actively being written to by an associated writer
-        """
-        self.file_io = file_io
-        self.tiff_path = tiff_path
-        self.file = self.file_io.open(tiff_path, "rb")
-        # mmap speeds up random access
-        self.mmap_file = mmap.mmap(self.file.fileno(), 0, prot=mmap.PROT_READ)
-        if summary_md is None:
-            self.summary_md, self.first_ifd_offset = self._read_header()
-        else:
-            self.summary_md = summary_md
-            self.major_version = MAJOR_VERSION
-            self.minor_version = MINOR_VERSION
-
-    def close(self):
-        """ """
-        self.mmap_file.close()
-        self.file.close()
-
-    def _read_header(self):
-        """
-        Returns
-        -------
-        summary metadata : dict
-        byte offsets : nested dict
-            The byte offsets of TIFF Image File Directories with keys [channel_index][z_index][frame_index][position_index]
-        first_image_byte_offset : int
-            int byte offset of first image IFD
-        """
-        # read standard tiff header
-        if self._read(0, 2) == b"\x4d\x4d":
-            # Big endian
-            if sys.byteorder != "big":
-                raise Exception("Potential issue with mismatched endian-ness")
-        elif self._read(0, 2) == b"\x49\x49":
-            # little endian
-            if sys.byteorder != "little":
-                raise Exception("Potential issue with mismatched endian-ness")
-        else:
-            raise Exception("Endian type not specified correctly")
-        if np.frombuffer(self._read(2,4), dtype=np.uint16)[0] != 42:
-            raise Exception("Tiff magic 42 missing")
-        first_ifd_offset = np.frombuffer(self._read(4,8), dtype=np.uint32)[0]
-
-        # read custom stuff: header, summary md
-        self.major_version = int.from_bytes(self._read(12, 16), sys.byteorder)
-        self.minor_version = int.from_bytes(self._read(16, 20), sys.byteorder)
-
-        summary_md_header, summary_md_length = np.frombuffer(self._read(20, 28), dtype=np.uint32)
-        if summary_md_header != self.SUMMARY_MD_HEADER:
-            raise Exception("Summary metadata header wrong")
-        summary_md = json.loads(self._read(28, 28 + summary_md_length))
-        return summary_md, first_ifd_offset
-
-    def _read(self, start, end):
-        """
-        convert to python ints
-        """
-        self.mmap_file.seek(int(start), 0)
-        return self.mmap_file.read(end - start)
-
-    def read_metadata(self, index):
-        return json.loads(
-            self._read(
-                index["metadata_offset"], index["metadata_offset"] + index["metadata_length"]
-            )
-        )
-
-    def read_image(self, index_entry):
-        if index_entry.pixel_type == self.EIGHT_BIT_RGB:
-            bytes_per_pixel = 3
-            dtype = np.uint8
-        elif index_entry.pixel_type == self.EIGHT_BIT_MONOCHROME:
-            bytes_per_pixel = 1
-            dtype = np.uint8
-        elif index_entry.pixel_type == self.SIXTEEN_BIT_MONOCHROME or \
-                index_entry.pixel_type == self.TEN_BIT_MONOCHROME or \
-                index_entry.pixel_type == self.TWELVE_BIT_MONOCHROME or \
-                index_entry.pixel_type == self.FOURTEEN_BIT_MONOCHROME or \
-                index_entry.pixel_type == self.ELEVEN_BIT_MONOCHROME:
-            bytes_per_pixel = 2
-            dtype = np.uint16
-        else:
-            raise Exception("unrecognized pixel type")
-        width = index_entry.image_width
-        height = index_entry.image_height
-        data = self._read(index_entry.pix_offset, index_entry.pix_offset + width * height * bytes_per_pixel)
-        if index_entry.pixel_compression == self.ZLIB_COMPRESSED:
-            data = zlib.decompress(data)
-        pixels = np.frombuffer(data, dtype=dtype)
-        image = pixels.reshape([height, width, 3] if bytes_per_pixel == 3 else [height, width])
-        return image

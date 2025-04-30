@@ -1,7 +1,7 @@
 import numpy as np
 import os
 import shutil
-from ndtiff_cfile import SingleNDTiffWriter, SingleNDTiffReader
+from ndtiff_cfile import SingleNDTiffWriter#, SingleNDTiffReader
 #from ..ndtiff_dataset import NDTiffDataset
 #from ..ndram_dataset import NDRAMDataset
 import pytest

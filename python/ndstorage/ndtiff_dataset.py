@@ -11,7 +11,7 @@ from .ndtiff_file import SingleNDTiffReader
 from .ndtiff_file import _CHANNEL_AXIS
 from .ndtiff_index import NDTiffIndexEntry, read_ndtiff_index
 
-from .ndtiff_file import SingleNDTiffWriter, MAJOR_VERSION, MINOR_VERSION
+from ndcfile import SingleNDTiffWriter#, MAJOR_VERSION, MINOR_VERSION
 
 from .ndstorage_base import WritableNDStorageAPI, NDStorageBase
 
@@ -46,8 +46,8 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
         self._lock = threading.RLock()
         self._put_image_lock = threading.Lock()
         if writable:
-            self.major_version = MAJOR_VERSION
-            self.minor_version = MINOR_VERSION
+            self.major_version = 3
+            self.minor_version = 3
             self._index_file = None
             if pixel_compression in [1,8]:
                 self._pixel_compression = pixel_compression
@@ -198,6 +198,7 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
             if self.name is not None:
                 filename = self.name + '_' + filename
             self.current_writer = SingleNDTiffWriter(self.path, filename, self._summary_metadata, self._pixel_compression)
+            print(f"Creating new file {self.current_writer.filename}")
             self.file_index += 1
             # create the index file
             self._index_file = open(os.path.join(self.path, "NDTiff.index"), "wb")
@@ -279,7 +280,9 @@ class NDTiffDataset(NDStorageBase, WritableNDStorageAPI):
                     new_reader = SingleNDTiffReader(os.path.join(self.path, index_entry.filename), file_io=self.file_io)
                 self._readers_by_filename[index_entry.filename] = new_reader
                 # Should be the same on every file so resetting them is fine
-                self.major_version, self.minor_version = new_reader.major_version, new_reader.minor_version
+                #self.major_version, self.minor_version = new_reader.major_version, new_reader.minor_version
+                self.major_version, self.minor_version = 3, 3
+
 
             self._parse_essential_image_metadata(index_entry)
 
