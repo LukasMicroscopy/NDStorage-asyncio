@@ -6,6 +6,11 @@ cimport cython
 #from cpython.collections cimport deque  # Import Cython deque
 from libc.stdio cimport fopen, fclose, fwrite, fread, fseek, ftell, fflush, FILE, SEEK_SET, SEEK_CUR, SEEK_END
 from libcpp cimport bool as bool_t
+from liburing cimport O_CREAT, O_RDWR, AT_FDCWD, iovec, io_uring, io_uring_get_sqe, \
+                     io_uring_prep_openat, io_uring_prep_write, io_uring_prep_read, \
+                     io_uring_prep_close, io_uring_submit, io_uring_wait_cqe, \
+                     io_uring_cqe_seen, io_uring_cqe, io_uring_queue_init, \
+                     io_uring_queue_exit, trap_error
 
 import numpy as np
 cimport numpy as cnp
@@ -52,9 +57,9 @@ cdef int STRIP_BYTE_COUNTS = 279
 cdef int X_RESOLUTION = 282
 cdef int Y_RESOLUTION = 283
 cdef int RESOLUTION_UNIT = 296
-cdef int MM_METADATA = 51123
+cdef long MM_METADATA = 51123
 
-cdef int SUMMARY_MD_HEADER = 2355492
+cdef long SUMMARY_MD_HEADER = 2355492
 
 
 cdef const char* _POSITION_AXIS = "position"
@@ -69,7 +74,7 @@ cdef class SingleNDTiffWriter:
     # type declarations
     #cdef str filename
     cdef dict index_map
-    cdef int next_ifd_offset_location
+    cdef long next_ifd_offset_location
     cdef int res_numerator
     cdef int res_denominator
     cdef int z_step_um
@@ -80,6 +85,11 @@ cdef class SingleNDTiffWriter:
     cdef bool_t first_ifd
     cdef int pixel_compression
     cdef FILE* cfile
+
+    cdef io_uring ring
+    cdef io_uring_cqe* cqes
+    cdef int fd
+
 
     def __init__(self, directory, filename, summary_md, pixel_compression = 1):
         self.filename = os.path.join(directory, filename)
@@ -94,27 +104,105 @@ cdef class SingleNDTiffWriter:
 
         self.write_lock = Lock()
 
+        self.ring = io_uring()
+        self.cqes = io_uring_cqe()
+
+        io_uring_queue_init(8, self.ring, 0) # initializes the io_uring structure with a queue depth of 8.
+
+        cdef int ret
+        sqe = io_uring_get_sqe(&self.ring)
+        # prepares an asynchronous file open operation.
+        io_uring_prep_openat(sqe, AT_FDCWD, self.filename.encode('utf-8'), O_CREAT | O_RDWR, 0o644)
+        io_uring_submit(&self.ring) # submits the operation.
+        io_uring_wait_cqe(&self.ring, &self.cqes) # waits for the operation to complete.
+        ret = self.cqes.res
+        io_uring_cqe_seen(&self.ring, self.cqes)
+
+        if ret < 0:
+            raise OSError(-ret, "Failed to open file")
+        self.fd = ret
+        print(f"File opened with fd: {self.fd}")
+
         if pixel_compression in [1, 8]:
             self.pixel_compression = pixel_compression
         else:
-            raise ValueError("Invalid pixel compression, only 1 (no compression) and 8 (zlib) are supported")
+            raise ValueError("Invalid pixel compression, only 1ORING_OP_FTRUNCATE': Fa (no compression) and 8 (zlib) are supported")
         
         os.makedirs(directory, exist_ok = True)
         
         # Open the file for writing
         # get file name as byte stream
-        cdef char* filename_byte_stream 
-        encode_filename = self.filename.encode('utf-8')
-        filename_byte_stream = <char*>encode_filename
+        #cdef char* filename_byte_stream 
+        #encode_filename = self.filename.encode('utf-8')
+        #filename_byte_stream = <char*>encode_filename
         
         # "w+": Open for reading and writing.
-        self.cfile = fopen(filename_byte_stream, 'w+')
+        #self.cfile = fopen(filename_byte_stream, 'w+')
         # make sure to start writing at the beginning of the file
-        fseek(self.cfile, 0, SEEK_SET)
+        #fseek(self.cfile, 0, SEEK_SET)
 
         # write the file header
         self._write_mm_header_and_summary_md(summary_md)
         self.reader = SingleNDTiffReader
+
+    cdef void _write_data(self, data: bytes):
+        """
+        Submit a write operation without waiting for its completion.
+        """
+
+        cdef io_uring_sqe* sqe
+        sqe = io_uring_get_sqe(&self.ring)
+        if sqe is NULL:
+            raise RuntimeError("Failed to get submission queue entry (SQE)")
+
+        # Prepare the write operation
+        io_uring_prep_write(sqe, self.fd, <const void*>data, len(data), 0)
+
+        # Submit the write operation
+        io_uring_submit(&self.ring)
+
+    cdef void _wait_for_pending_writes(self):
+        """
+        Wait for all pending write operations to complete.
+        """
+        cdef io_uring_cqe* cqe
+        cdef int ret
+
+        while True:
+            # Wait for a completion queue entry (CQE)
+            ret = io_uring_wait_cqe(&self.ring, &cqe)
+            if ret < 0:
+                raise OSError(-ret, "Failed to wait for completion queue entry (CQE)")
+
+            # Check the result of the operation
+            if cqe.res < 0:
+                raise OSError(-cqe.res, "Write operation failed")
+
+            print(f"Write operation completed successfully, {cqe.res} bytes written")
+
+            # Mark the CQE as seen
+            io_uring_cqe_seen(&self.ring, cqe)
+
+            # Break if there are no more pending writes
+            if io_uring_peek_cqe(&self.ring, &cqe) == -1:
+                break
+
+    def __dealloc__(self):
+        # Close the file asynchronously
+        self._wait_for_pending_writes()
+        if self.fd >= 0:
+            sqe = io_uring_get_sqe(&self.ring)
+            io_uring_prep_close(sqe, self.fd)
+            io_uring_submit(&self.ring)
+            io_uring_wait_cqe(&self.ring, &self.cqes)
+            io_uring_cqe_seen(&self.ring, self.cqes)
+            self.fd = -1
+
+        # Clean up io_uring
+        io_uring_queue_exit(&self.ring)
+        if self.ring is not NULL:
+            io_uring_queue_exit(self.ring)
+            self.ring = NULL
 
     def has_space_to_write(self, cnp.ndarray pixels, dict metadata):
         cdef bool_t rgb = pixels.ndim == 3 and pixels.shape[2] == 3
@@ -170,13 +258,14 @@ cdef class SingleNDTiffWriter:
         """
         Write the buffer to the file
         """
+        self._wait_for_pending_writes()
         while self.buffers:
             buffer = self.buffers.popleft()
             #buffer, size = self.buffers.popleft()
             self._write_object(buffer)
             #fwrite(<const void*>buffer, 1, size, self.cfile)
-        with cython.nogil:
-            fflush(self.cfile)
+        #with cython.nogil:
+        #    fflush(self.cfile)
 
     cdef void _append_buffer(self, object obj):
         """
@@ -232,37 +321,56 @@ cdef class SingleNDTiffWriter:
             data = <const unsigned char*>obj
             # Get the size of the bytearray
             size = len(obj)
-            fwrite(<const void*>data, 1, size, self.cfile)
+            #fwrite(<const void*>data, 1, size, self.cfile)
+            self._write_data(data)
         elif isinstance(obj, cnp.ndarray):
             # Make sure the arraz is not altered while we are writing
             data_bytes = obj.tobytes()
             data = <const unsigned char*>data_bytes
             # Get the size of the array in bytes
             size = obj.size * obj.itemsize
-            fwrite(<const void*>data, 1, size, self.cfile)
+            #fwrite(<const void*>data, 1, size, self.cfile)
+            self._write_data(data)
         elif isinstance(obj, dict):
             # Serialize the dictionary to a JSON string and encode it as UTF-8
             json_bytes = json.dumps(obj).encode('utf-8')
             data = json_bytes
             size = len(json_bytes)
-            fwrite(<const void*>data, 1, size, self.cfile)
+            #fwrite(<const void*>data, 1, size, self.cfile)
+            self._write_data(data)
         elif isinstance(obj, str):
             # Convert the string to bytes and write it to the file
             data_bytes = obj.encode('utf-8')
             data = <const unsigned char*>data_bytes.data
             # Get the size of the array in bytes
             size = len(data_bytes)
-            fwrite(<const void*>data, 1, size, self.cfile)
+            #fwrite(<const void*>data, 1, size, self.cfile)
+            self._write_data(data)
         else:
             raise TypeError("Unsupported data type")
 
     def finished_writing(self):
         self._write_null_offset_after_last_image()
         #self.cfile.ftruncate()
-        fflush(self.cfile)
+        #fflush(self.cfile)
         # close the file
-        fclose(self.cfile)
-        self.cfile = NULL
+        #fclose(self.cfile)
+        #self.cfile = NULL
+        #self.file.close()# Close the file asynchronously
+        self._wait_for_pending_writes()
+        if self.fd >= 0:
+            sqe = io_uring_get_sqe(&self.ring)
+            io_uring_prep_close(sqe, self.fd)
+            io_uring_submit(&self.ring)
+            io_uring_wait_cqe(&self.ring, &self.cqes)
+            io_uring_cqe_seen(&self.ring, self.cqes)
+            self.fd = -1
+
+        # Clean up io_uring
+        if self.ring is not NULL:
+            io_uring_queue_exit(self.ring)
+            self.ring = NULL   
+
 
     cdef void _write_null_offset_after_last_image(self):
         cdef bytearray buffer = bytearray(4)
@@ -349,23 +457,29 @@ cdef class SingleNDTiffWriter:
         # 6 bytes for bits per sample if RGB, 16 bytes for x and y resolution, 1 byte per character of MD string
         # number of bytes for pixels
 
-        cdef int ifd_and_bit_depth_bytes
+        cdef long ifd_and_bit_depth_bytes
         ifd_and_bit_depth_bytes = 2 + num_entries * 12 + 4 + (6 if rgb else 0) + 16
         cdef bytearray ifd_and_small_vals_buffer = bytearray(ifd_and_bit_depth_bytes)
 
         # Needed to reset to zero after last IFD
         self.next_ifd_offset_location = ftell(self.cfile) + 2 + num_entries * 12
-        cdef int bits_per_sample_offset = self.next_ifd_offset_location + 4
-        cdef int x_resolution_offset = bits_per_sample_offset + (6 if rgb else 0)
-        cdef int y_resolution_offset = x_resolution_offset + 8
-        cdef int pixel_data_offset = y_resolution_offset + 8
+        cdef long bits_per_sample_offset = self.next_ifd_offset_location + 4
+        cdef long x_resolution_offset = bits_per_sample_offset + (6 if rgb else 0)
+        cdef long y_resolution_offset = x_resolution_offset + 8
+        cdef long pixel_data_offset = y_resolution_offset + 8
+        if pixel_data_offset < 0:
+            print(f"Pixel data offset: {pixel_data_offset} is negative")
+            print(f"Image height: {image_height}, Image width: {image_width}, Bytes per image pixels: {bytes_per_image_pixels}")
+            print(f"Bytes per image pixels: {bytes_per_image_pixels}, Metadata length: {len(metadata)}")
+            print(f"bits_per_sample_offset: {bits_per_sample_offset}, X resolution offset: {x_resolution_offset}")
+            print(f"Y resolution offset: {y_resolution_offset}, Pixel data offset: {pixel_data_offset}")
         cdef long metadata_offset = pixel_data_offset + bytes_per_image_pixels
 
-        cdef int next_ifd_offset = metadata_offset + len(metadata)
+        cdef long next_ifd_offset = metadata_offset + len(metadata)
         if next_ifd_offset % 2 == 1:
             next_ifd_offset += 1  # Make IFD start on word
 
-        cdef int buffer_position = 0
+        cdef long buffer_position = 0
         struct.pack_into('<H', ifd_and_small_vals_buffer, buffer_position, num_entries)
         buffer_position += 2
 
@@ -433,6 +547,11 @@ cdef class SingleNDTiffWriter:
                                 len(metadata), self.filename.split(os.sep)[-1], pixel_compression)
 
     cdef int _write_ifd_entry(self, bytearray buffer, long tag, long dtype, long count, long value, long buffer_position):
+        cdef long max = 4294967295
+        if len(buffer) > max or buffer_position > max or tag > max or dtype > max or count > max or value > max:
+            print(f"Buffer size: {len(buffer)}, Buffer position: {buffer_position}, Tag: {tag}, Dtype: {dtype}, Count: {count}, Value: {value}")
+        if value < 0:
+            print(f"Value: {value} is negative")
         struct.pack_into('<HHII', buffer, buffer_position, tag, dtype, count, value)
         return 12
 

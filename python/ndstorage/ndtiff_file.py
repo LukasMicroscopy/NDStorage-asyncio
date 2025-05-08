@@ -12,6 +12,12 @@ from io import BytesIO
 from .file_io import NDTiffFileIO, BUILTIN_FILE_IO
 from .ndtiff_index import NDTiffIndexEntry
 
+from liburing import O_CREAT, O_RDWR, AT_FDCWD, iovec, io_uring, io_uring_get_sqe, \
+                     io_uring_prep_openat, io_uring_prep_write, io_uring_prep_read, \
+                     io_uring_prep_close, io_uring_submit, io_uring_wait_cqe, \
+                     io_uring_cqe_seen, io_uring_cqe, io_uring_queue_init, \
+                     io_uring_queue_exit, trap_error
+
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
@@ -69,12 +75,33 @@ class SingleNDTiffWriter:
         self.start_time = None
         
         os.makedirs(directory, exist_ok=True)
+        
+        self.ring = io_uring()
+        self.cqe = io_uring_cqe()  # completion queue entry
+        
+        io_uring_queue_init(32, self.ring, 0)
+
+        # pre-allocate the file 
+        file_path = os.path.join(directory, filename)
+        _path = str(file_path).encode()
+        # if `path` is relative and `dir_fd` is `AT_FDCWD`, then `path` is relative
+        # to current working directory. Also `_path` must be in bytes
+
+        sqe = io_uring_get_sqe(self.ring)  # sqe(submission queue entry)
+        io_uring_prep_openat(sqe, _path, flags, mode, dir_fd)
+        # set submit entry identifier as `1` which is returned back in `cqe.user_data`
+        # so you can keep track of submit/completed entries.
+        io_uring_sqe_set_data64(sqe, 1)
+        
+        
+        
         # pre-allocate the file 
         file_path = os.path.join(directory, filename)
         with open(file_path, 'wb') as f:
-            f.seek(MAX_FILE_SIZE - 1)
-            f.write(b'\0')
-            f.flush()
+            f.truncate(MAX_FILE_SIZE)
+            #f.seek(MAX_FILE_SIZE - 1)
+            #f.write(b'\0')
+            #f.flush()
 
         # reopen the file in binary mode
         self.file = open(file_path, 'rb+')
