@@ -16,7 +16,8 @@ from liburing import O_CREAT, O_RDWR, AT_FDCWD, iovec, io_uring, io_uring_get_sq
                      io_uring_prep_openat, io_uring_prep_write, io_uring_prep_read, \
                      io_uring_prep_close, io_uring_submit, io_uring_wait_cqe, \
                      io_uring_cqe_seen, io_uring_cqe, io_uring_queue_init, \
-                     io_uring_queue_exit, trap_error
+                     io_uring_prep_fsync, IORING_FSYNC_DATASYNC, \
+                     io_uring_queue_exit, io_uring_peek_cqe, trap_error
 
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -87,29 +88,213 @@ class SingleNDTiffWriter:
         # if `path` is relative and `dir_fd` is `AT_FDCWD`, then `path` is relative
         # to current working directory. Also `_path` must be in bytes
 
+        flags = O_CREAT | O_RDWR
+        mode = 0o666
+        dir_fd = AT_FDCWD
+        # open the file using io_uring
         sqe = io_uring_get_sqe(self.ring)  # sqe(submission queue entry)
         io_uring_prep_openat(sqe, _path, flags, mode, dir_fd)
         # set submit entry identifier as `1` which is returned back in `cqe.user_data`
         # so you can keep track of submit/completed entries.
-        io_uring_sqe_set_data64(sqe, 1)
-        
+        #io_uring_sqe_set_data64(sqe, 1)
+        io_uring_submit(self.ring)
+        # wait for the completion of the openat operation
+        io_uring_wait_cqe(self.ring, self.cqe)
+        # check for errors
+        if self.cqe.res < 0:
+            # handle error
+            print(f"Error opening file: {self.cqe.res}")
+            raise Exception(f"Error opening file: {self.cqe.res}")
+        # get the file descriptor from the completion queue entry
+        self.fd = self.cqe.res
+        # mark the completion queue entry as seen
+        io_uring_cqe_seen(self.ring, self.cqe)
+        # now we can use the file descriptor to write to the file
+        # create a file object from the file descriptor
+        #self.file = os.fdopen(fd, 'wb+')
+        # set the file descriptor to non-blocking mode
+        #fcntl.fcntl(self.file, fcntl.F_SETFL, os.O_NONBLOCK)
+        # set the file position to the end of the file
+        #self.file.seek(0, os.SEEK_END)
+        # get the current file position
         
         
         # pre-allocate the file 
-        file_path = os.path.join(directory, filename)
-        with open(file_path, 'wb') as f:
-            f.truncate(MAX_FILE_SIZE)
+        #file_path = os.path.join(directory, filename)
+        #with open(file_path, 'wb') as f:
+            #f.truncate(MAX_FILE_SIZE)
             #f.seek(MAX_FILE_SIZE - 1)
             #f.write(b'\0')
             #f.flush()
 
         # reopen the file in binary mode
-        self.file = open(file_path, 'rb+')
+        
+        #self.file = open(file_path, 'rb+')
         # reset position to 0
-        self.file.seek(0)
+        #self.file.seek(0)
 
         self._write_mm_header_and_summary_md(summary_md)
         self.reader = SingleNDTiffReader(self.filename, summary_md=summary_md)
+
+    def _write_data(self, data):
+        # create a buffer for the data
+        buffer = self._to_bytearray(data)
+        # create an iovec structure for the data
+        iov = iovec(buffer, len(buffer))
+        # get a submission queue entry
+        sqe = io_uring_get_sqe(self.ring)
+        # prepare a write operation
+        io_uring_prep_write(sqe, self.fd, iov, len(buffer), 0)
+        # submit the write operation
+        io_uring_submit(self.ring)
+
+    def _write_buffer(self):
+        self._wait_for_pending_writes()
+        while self.buffers:
+            buffer = self.buffers.popleft()
+            #buffer, size = self.buffers.popleft()
+            self._write_data(buffer)
+            #fwrite(<const void*>buffer, 1, size, self.cfile)
+        #with cython.nogil:
+        #    fflush(self.cfile)
+
+    def _wait_for_pending_writes(self):
+        # wait for the completion of the write operation
+        cqe = io_uring_peek_cqe(self.ring, self.cqe)
+        if cqe is None:
+            print("No pending operations in the completion queue.")
+            return  # Avoid blocking if there are no pending operations
+        # wait for a completion queue entry
+        print(cqe)
+        io_uring_wait_cqe(self.ring, self.cqe)
+        # check for errors
+        if self.cqe.res < 0:
+            # handle error
+            print(f"Error writing to file: {self.cqe.res}")
+            raise Exception(f"Error writing to file: {self.cqe.res}")
+        # mark the completion queue entry as seen
+        io_uring_cqe_seen(self.ring, self.cqe)
+
+    def _tell(self):
+        """
+        Get the current file pointer position using lseek.
+        """
+        self._wait_for_pending_writes()
+        position = os.lseek(self.fd, 0, os.SEEK_CUR)
+        if position == -1:
+            raise OSError("Failed to get file pointer position")
+        return position
+
+    def _seek(self, offset, whence=os.SEEK_SET):
+        """
+        Set the file pointer position using liburing's lseek operation.
+
+        Parameters:
+            offset (int): The offset to set the file pointer to.
+            whence (int): How the offset is interpreted (os.SEEK_SET, os.SEEK_CUR, os.SEEK_END).
+
+        Returns:
+            int: The new file pointer position.
+        """
+        self._wait_for_pending_writes()
+        position = os.lseek(self.fd, offset, whence)
+        if position == -1:
+            raise OSError("Failed to set file pointer position")
+        return position
+        # Get a submission queue entry (SQE)
+        #sqe = io_uring_get_sqe(self.ring)
+        #if sqe is None:
+        #    raise RuntimeError("Failed to get submission queue entry (SQE)")
+
+        # Prepare the lseek operation
+        #io_uring_prep_lseek(sqe, self.fd, offset, whence)
+
+        # Submit the lseek operation
+        #io_uring_submit(self.ring)
+
+
+    def _flush(self):
+        """
+        Flush all pending writes to disk using liburing's fsync operation.
+        """
+        # Get a submission queue entry (SQE)
+        sqe = io_uring_get_sqe(self.ring)
+        if sqe is None:
+            raise RuntimeError("Failed to get submission queue entry (SQE)")
+
+        # Prepare the fsync operation
+        io_uring_prep_fsync(sqe, self.fd, IORING_FSYNC_DATASYNC)
+
+        # Submit the fsync operation
+        io_uring_submit(self.ring)
+
+        # Wait for the completion queue entry (CQE)
+        cqe = io_uring_wait_cqe(self.ring)
+        if cqe.res < 0:
+            raise OSError(-cqe.res, "Failed to flush data to disk")
+
+        # Mark the CQE as seen
+        io_uring_cqe_seen(self.ring, cqe)
+
+    def _close(self):
+        """
+        Close the file asynchronously using io_uring_prep_close.
+        """
+        # Get a submission queue entry (SQE)
+        sqe = io_uring_get_sqe(self.ring)
+        if sqe is None:
+            raise RuntimeError("Failed to get submission queue entry (SQE)")
+
+        # Prepare the close operation
+        io_uring_prep_close(sqe, self.fd)
+
+        # Submit the close operation
+        io_uring_submit(self.ring)
+
+        # Wait for the completion queue entry (CQE)
+        cqe = io_uring_wait_cqe(self.ring)
+        if cqe.res < 0:
+            raise OSError(-cqe.res, "Failed to close file")
+
+        # Mark the CQE as seen
+        io_uring_cqe_seen(self.ring, cqe)
+
+        print("File closed successfully.")
+
+        # Clean up io_uring
+        io_uring_queue_exit(self.ring)
+
+    def _to_bytearray(self, data):
+        """
+        Converts various data types (bytes, numpy.ndarray, dict, str) into a bytearray.
+
+        Parameters:
+            data: The input data to be converted.
+
+        Returns:
+            bytearray: The converted data as a bytearray.
+
+        Raises:
+            TypeError: If the input data type is unsupported.
+        """
+        if isinstance(data, bytes):
+            # Convert bytes to bytearray
+            return bytearray(data)
+        elif isinstance(data, bytearray):
+            # Already a bytearray, return as is
+            return data
+        elif isinstance(data, np.ndarray):
+            # Convert numpy array to bytearray
+            return bytearray(data.tobytes())
+        elif isinstance(data, dict):
+            # Serialize dict to JSON string and convert to bytearray
+            json_bytes = json.dumps(data).encode('utf-8')
+            return bytearray(json_bytes)
+        elif isinstance(data, str):
+            # Convert string to bytearray
+            return bytearray(data.encode('utf-8'))
+        else:
+            raise TypeError(f"Unsupported data type: {type(data)}")
 
     def has_space_to_write(self, pixels, metadata):
         rgb = pixels.ndim == 3 and pixels.shape[2] == 3
@@ -118,7 +303,7 @@ class SingleNDTiffWriter:
         extra_padding = 5000000  # 5 MB extra padding
         bytes_per_pixels = self._bytes_per_image_pixels(pixels, rgb)
 
-        size = md_length + IFD_size + bytes_per_pixels + extra_padding + self.file.tell()
+        size = md_length + IFD_size + bytes_per_pixels + extra_padding + self._tell()
 
         if size >= MAX_FILE_SIZE:
             return False
@@ -146,25 +331,32 @@ class SingleNDTiffWriter:
         # 8 bytes for summaryMD header and summary md length
         struct.pack_into('<II', header_buffer, 20, SUMMARY_MD_HEADER, md_length)
 
-        for buffer in [header_buffer, summary_md_bytes]:
-            self.file.write(buffer)
+        self.buffers.append(header_buffer)
+        #self._append_buffer(header_buffer)
+        self.buffers.append(summary_md_bytes)
+        #self._append_buffer(summary_md_bytes)
+
+        self._write_buffer()
 
     def _get_bytes_from_string(self, s):
         return s.encode('utf-8')
 
     def finished_writing(self):
         self._write_null_offset_after_last_image()
-        self.file.truncate()
-        self.file.flush()
-        self.file.close()
+        #self.file.truncate()
+        self._flush()
+        self._wait_for_pending_writes()
+        self._close()
 
     def _write_null_offset_after_last_image(self):
+        self._wait_for_pending_writes()
         buffer = bytearray(4)
         struct.pack_into('<I', buffer, 0, 0)
-        current_pos = self.file.tell()
-        self.file.seek(self.next_ifd_offset_location)
-        self.file.write(buffer)
-        self.file.seek(current_pos)
+        current_pos = self._tell()
+        self._seek(self.next_ifd_offset_location)
+        self._write_data(buffer)
+        self._seek(current_pos)
+        self._wait_for_pending_writes()
 
     def write_image(self, index_key, pixels, metadata, bit_depth='auto', pixel_compression = 0):
         """
@@ -205,17 +397,19 @@ class SingleNDTiffWriter:
         if isinstance(metadata, dict):
             metadata = self._get_bytes_from_string(json.dumps(metadata))
         ied = self._write_ifd(index_key, pixels, metadata, rgb, image_height, image_width, bit_depth, pixel_compression)
-        while self.buffers:
-            self.file.write(self.buffers.popleft())
+        #while self.buffers:
+        #    self.file.write(self.buffers.popleft())
         # make sure the file is flushed to disk
-        self.file.flush()
+        self._write_buffer()
+        #self.file.flush()
         self.index_map[index_key] = ied
         return ied
 
 
     def _write_ifd(self, index_key, pixels, metadata, rgb, image_height, image_width, bit_depth, pixel_compression):
-        if self.file.tell() % 2 == 1:
-            self.file.seek(self.file.tell() + 1)  # Make IFD start on word
+        if self._tell() % 2 == 1:
+            #self.file.seek(self.file.tell() + 1)  # Make IFD start on word
+            self._seek(self._tell() + 1)
 
         if isinstance(pixels, bytearray):
             byte_depth = 1
@@ -242,7 +436,7 @@ class SingleNDTiffWriter:
         ifd_and_small_vals_buffer = bytearray(ifd_and_bit_depth_bytes)
 
         # Needed to reset to zero after last IFD
-        self.next_ifd_offset_location = self.file.tell() + 2 + num_entries * 12
+        self.next_ifd_offset_location = self._tell() + 2 + num_entries * 12
         bits_per_sample_offset = self.next_ifd_offset_location + 4
         x_resolution_offset = bits_per_sample_offset + (6 if rgb else 0)
         y_resolution_offset = x_resolution_offset + 8

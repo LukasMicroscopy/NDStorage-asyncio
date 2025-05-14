@@ -7,11 +7,11 @@ import warnings
 import re
 
 from .file_io import NDTiffFileIO, BUILTIN_FILE_IO
-from .ndtiff_file import SingleNDTiffReader, MAJOR_VERSION, MINOR_VERSION#, SingleNDTiffWriter
+from .ndtiff_file import SingleNDTiffReader, MAJOR_VERSION, MINOR_VERSION, SingleNDTiffWriter
 from .ndtiff_file import _CHANNEL_AXIS
 from .ndtiff_index import NDTiffIndexEntry, read_ndtiff_index
 
-from ndcfile import SingleNDTiffWriter#, MAJOR_VERSION, MINOR_VERSION
+#from ndcfile import SingleNDTiffWriter#, MAJOR_VERSION, MINOR_VERSION
 
 from .ndstorage_base import WritableNDStorageAPI, NDStorageBase
 
